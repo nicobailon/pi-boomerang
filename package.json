@@ -1,0 +1,20 @@
+{
+  "name": "pi-boomerang",
+  "version": "0.1.0",
+  "description": "Token-efficient autonomous task execution with context collapse",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*"
+  }
+}
