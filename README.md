@@ -29,7 +29,7 @@ An inverted [D-Mail](https://steins-gate.fandom.com/wiki/D-Mail): where D-Mail r
 ## Install
 
 ```bash
-pi install pi-boomerang
+pi install npm:pi-boomerang
 ```
 
 Then restart pi to load the extension.
