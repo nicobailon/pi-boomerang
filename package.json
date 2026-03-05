@@ -13,6 +13,11 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "devDependencies": {
     "vitest": "^2.0.0",
     "@mariozechner/pi-coding-agent": "*",
