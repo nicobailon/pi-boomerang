@@ -1,6 +1,6 @@
 {
   "name": "pi-boomerang",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Token-efficient autonomous task execution with context collapse",
   "type": "module",
   "pi": {
@@ -11,7 +11,8 @@
   "files": [
     "index.ts",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "banner.png"
   ],
   "scripts": {
     "test": "vitest run",

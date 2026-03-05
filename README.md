@@ -19,7 +19,8 @@ Long autonomous tasks consume massive context. A bug fix that reads 10 files, ma
 ```
 [BOOMERANG COMPLETE]
 Task: "Fix the login bug"
-Result: Read 10 file(s), modified src/auth.ts, src/login.ts, ran 3 command(s).
+Actions: read 10 file(s), modified src/auth.ts, src/login.ts, ran 3 command(s).
+Outcome: Fixed the login bug by correcting the JWT validation logic...
 ```
 
 Same outcome. Fraction of the tokens. The session tree preserves full history for `/tree` navigation if you need it.
@@ -37,134 +38,129 @@ Then restart pi to load the extension.
 ## Quick Start
 
 ```bash
-# Autonomous task execution
+# Plain task
 /boomerang Refactor the auth module to use JWT
 
-# Cancel mid-task (no context collapse)
+# Run a prompt template
+/boomerang /commit "fix auth bug"
+
+# Chain templates together
+/boomerang /scout "map the auth module" -> /planner "design JWT refresh" -> /impl
+
+# Cancel mid-task (no collapse)
 /boomerang-cancel
-
-# Set an anchor for batch work
-/boomerang anchor
-
-# Inspect or clear the anchor
-/boomerang anchor show
-/boomerang anchor clear
 ```
 
-The agent works without asking questions, making reasonable assumptions. When complete, the extension collapses the work into a summary branch.
+The agent works without asking questions, making reasonable assumptions. When complete, everything collapses into a summary branch.
 
-## How It Works
+## Chain Execution
 
-```
-1. /boomerang <task>           → Records current entry ID, sends task
-2. before_agent_start          → Injects autonomous mode instructions
-3. Agent works                 → Multiple LLM calls, tool use, no interruptions
-4. agent_end                   → Generates summary, calls navigateTree()
-5. Session branches            → Work preserved in tree, summary branch active
+Run multiple templates in sequence with a single collapse at the end:
+
+```bash
+/boomerang /scout "analyze the codebase" -> /planner "design the fix" -> /impl "build it"
 ```
 
-The collapse uses `navigateTree()`, the same mechanism as `/tree`. The work is preserved in the session tree and can be accessed via `/tree`.
+Each step can specify its own args inline. You can also set global args as a fallback for steps without inline args:
 
-### Anchor Mode (Optional)
-
-Without an anchor, each `/boomerang <task>` is self-contained—collapses just its own work to the entry right before the task started.
-
-Set an anchor when you want multiple tasks to share the same collapse point:
-
-```
-1. /boomerang anchor           → Records the current entry as anchor
-2. /boomerang <task A>         → Branches to anchor with summary A
-3. /boomerang <task B>         → Branches to anchor with summaries A + B
-4. /boomerang anchor show      → Shows anchor info and task count
-5. /boomerang anchor clear     → Removes the anchor
+```bash
+/boomerang /scout -> /planner -> /impl -- "build the auth system"
 ```
 
-Summaries accumulate, so each subsequent task's context includes what came before.
+Each template's frontmatter controls model, skill, and thinking level for that step. Scout runs on sonnet, planner on opus, impl on whatever—boomerang switches automatically and restores your original config after collapse.
 
-## Commands
+Status indicator shows progress as `chain 1/3`, `chain 2/3`, etc.
 
-**Task execution:**
-- `/boomerang <task>` — Execute autonomously, then collapse
-- `/boomerang-cancel` — Abort without collapsing
+## Prompt Templates
 
-**Anchor management:**
-- `/boomerang anchor` — Set collapse point
-- `/boomerang anchor show` — Show info
-- `/boomerang anchor clear` — Remove anchor
+If the task starts with `/`, boomerang treats it as a template reference:
 
-## Status Indicator
-
-The footer shows boomerang state:
-
-- **anchor** (cyan) — Anchor set, waiting for the next boomerang
-- **boomerang** (yellow) — Active, agent working autonomously
-
-## Summary Format
-
-The heuristic summary extracts file operations from tool calls:
-
-```
-[BOOMERANG COMPLETE]
-Task: "Fix the login bug"
-Result: Read 3 file(s), modified src/auth.ts, src/login.ts, ran 2 command(s).
+```bash
+/boomerang /commit "fix the auth bug"
+/boomerang /codex/review "the auth module"
 ```
 
-## Edge Cases
+Templates load from `<cwd>/.pi/prompts/` first, then `~/.pi/agent/prompts/`. Subdirectories map to path segments (`/codex/review` → `codex/review.md`).
 
-| Scenario | Behavior |
-|----------|----------|
-| No task provided | Error: "Usage: /boomerang <task> \| anchor [clear\|show]" |
-| Already in boomerang | Error: "Boomerang already active" |
-| Agent busy | Error: "Wait for completion first" |
-| Agent asks question anyway | Boomerang completes, branches with partial summary |
-| Cancel mid-task | Task cleared, no branch created; anchor preserved if set |
-| Error/abort during task | Boomerang completes with partial summary |
+Frontmatter fields:
 
-## Accessing Collapsed Work
+```markdown
+---
+model: claude-opus-4-6
+skill: git-workflow
+thinking: xhigh
+---
+Commit current work. $@
+```
 
-The work isn't deleted—it's preserved in the session tree. Use `/tree` to navigate back to the full work history if needed.
+- `model` — switches before the task, restores after
+- `skill` — injects into the system prompt
+- `thinking` — sets thinking level, restores after
+- `$@` expands to all args, `$1` `$2` etc. for positional
 
-## Interaction with Rewind Extension
+## Anchor Mode
 
-Independent. They solve different problems:
+By default, each boomerang collapses just its own work. Set an anchor when you want multiple tasks to share the same collapse point:
 
-- **pi-boomerang** — Collapses *context/tokens* (branches to summary)
-- **Rewind** — Restores *files* (git worktree state)
+```bash
+/boomerang anchor              # set anchor here
+/boomerang "task A"            # collapses to anchor with summary A
+/boomerang "task B"            # collapses to anchor with summaries A + B
+/boomerang anchor clear        # remove anchor
+```
 
-Use together: pi-boomerang collapses conversation tokens, rewind restores files if the agent broke something.
-
-## vs pi-context
-
-[pi-context](https://github.com/ttttmr/pi-context) takes a different approach: give the agent Git-like tools (`context_tag`, `context_log`, `context_checkout`) to manage its own context. The agent creates milestones, monitors token usage, decides when to squash.
-
-The problem: LLMs cut corners when told about resource limits. "You're at 80% capacity" triggers scarcity mindset—rushing, skipping exploration, shallower analysis. The agent optimizes for efficiency over quality.
-
-pi-boomerang keeps the agent unaware. It sees the task, works thoroughly, collapse happens invisibly. Even anchor mode doesn't leak—the agent does each task without knowing it's part of a batch.
+Summaries accumulate, so each task's context includes what came before.
 
 ## Agent-Callable Tool
 
-The extension also registers a `boomerang` tool that agents can call directly for self-managed context collapse:
+The extension registers a `boomerang` tool that agents can call directly. The agent sets an anchor, does work, calls boomerang again to collapse. Useful for self-managed context without user intervention.
 
+**Disabled by default** because agents got too aggressive with it. Enable with:
+
+```bash
+/boomerang tool on
 ```
-1. Agent calls boomerang()     → Sets anchor at current position
-2. Agent does work             → Multiple tool calls, file operations
-3. Agent calls boomerang()     → Triggers collapse from anchor
+
+You can provide guidance for when the agent should use it:
+
+```bash
+/boomerang tool on "Use only for tasks that modify 3+ files"
+/boomerang guidance "Use for refactoring or multi-step implementations"
 ```
 
-This is useful when an agent wants to manage its own context without user intervention.
+Tool state and guidance persist to `~/.pi/agent/boomerang.json` across restarts.
 
-**Important limitation:** When triggered via the tool, the chat history may not visually update immediately. The context IS collapsed (the agent sees the collapsed state on subsequent turns), but the UI continues showing the old messages until you run `/reload` or start a new session.
+One quirk: tool-initiated collapse may not update the UI immediately (the context IS collapsed, agent sees it, but chat display lags until `/reload`).
 
-This happens because:
-- The `/boomerang` command has access to `navigateTree()` which updates both the session tree AND the UI
-- The tool only has access to `branchWithSummary()` which updates the tree but not the UI
-- If you've run any `/boomerang` command previously in the session, the tool can borrow that context and get full UI updates
+## Commands
 
-The tool is also disabled during an active command boomerang to prevent conflicts.
+| Command | What it does |
+|---------|--------------|
+| `/boomerang <task>` | Execute and collapse |
+| `/boomerang /<template> [args]` | Run template and collapse |
+| `/boomerang /a -> /b -> /c` | Chain templates |
+| `/boomerang-cancel` | Abort without collapsing |
+| `/boomerang anchor` | Set collapse point |
+| `/boomerang anchor show` | Show anchor info |
+| `/boomerang anchor clear` | Remove anchor |
+| `/boomerang tool [on\|off]` | Enable/disable agent tool |
+| `/boomerang guidance [text]` | Set/show/clear guidance |
+
+## vs pi-context
+
+[pi-context](https://github.com/ttttmr/pi-context) gives the agent Git-like tools to manage its own context—create milestones, monitor token usage, decide when to squash.
+
+The problem: LLMs cut corners when told about resource limits. "You're at 80% capacity" triggers scarcity mindset—rushing, skipping exploration, shallower analysis.
+
+pi-boomerang keeps the agent unaware. It sees the task, works thoroughly, collapse happens invisibly.
+
+## Interaction with Rewind Extension
+
+Independent. pi-boomerang collapses *context/tokens*. Rewind restores *files*. Use together: boomerang saves tokens, rewind fixes broken files.
 
 ## Limitations
 
 - Summary is heuristic—extracts file operations from tool calls, may miss semantic details
 - Agent might still ask questions despite instructions (boomerang completes anyway)
-- Anchor state is in-memory only and clears on session start/switch
-- Tool-initiated collapse may not update UI immediately (use `/reload` to refresh)
+- Anchor state is in-memory only, clears on session start/switch
+- Tool-initiated collapse may not update UI immediately (`/reload` to refresh)

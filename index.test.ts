@@ -1,23 +1,124 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, SessionEntry } from "@mariozechner/pi-coding-agent";
 
-import boomerangExtension from "./index.js";
+const mockState = vi.hoisted(() => ({
+  homeDir: "",
+}));
+
+vi.mock("node:os", async () => {
+  const actual = await vi.importActual<typeof import("node:os")>("node:os");
+  return {
+    ...actual,
+    homedir: () => mockState.homeDir,
+  };
+});
+
+import boomerangExtension, { getEffectiveArgs, parseChain } from "./index.js";
+
+describe("parseChain", () => {
+  it("parses basic chains", () => {
+    expect(parseChain("/a -> /b")).toEqual({
+      steps: [{ templateRef: "a", args: [] }, { templateRef: "b", args: [] }],
+      globalArgs: [],
+    });
+    expect(parseChain("/a -> /b -> /c")?.steps).toHaveLength(3);
+  });
+
+  it("parses global args after --", () => {
+    const result = parseChain('/a -> /b -- "global"');
+    expect(result?.globalArgs).toEqual(["global"]);
+    expect(result?.steps[0].args).toEqual([]);
+    expect(result?.steps[1].args).toEqual([]);
+  });
+
+  it("parses per-step args", () => {
+    const result = parseChain('/a "x" "y" -> /b');
+    expect(result?.steps[0].args).toEqual(["x", "y"]);
+    expect(result?.steps[1].args).toEqual([]);
+  });
+
+  it("parses mixed per-step and global args", () => {
+    const result = parseChain('/a "inline" -> /b -> /c -- "global"');
+    expect(result?.steps[0].args).toEqual(["inline"]);
+    expect(result?.steps[1].args).toEqual([]);
+    expect(result?.steps[2].args).toEqual([]);
+    expect(result?.globalArgs).toEqual(["global"]);
+  });
+
+  it("preserves arrow in quoted arg", () => {
+    const result = parseChain('/a -> /b "plan -> execute"');
+    expect(result?.steps[1].args).toEqual(["plan -> execute"]);
+  });
+
+  it("handles subdirectory templates", () => {
+    const result = parseChain("/codex/scout -> /codex/plan");
+    expect(result?.steps[0].templateRef).toBe("codex/scout");
+  });
+
+  it("returns null for non-chain and malformed inputs", () => {
+    expect(parseChain("/single")).toBeNull();
+    expect(parseChain("/a -> b")).toBeNull();
+    expect(parseChain("-> /b")).toBeNull();
+    expect(parseChain("/a ->")).toBeNull();
+    expect(parseChain("/a -> -> /c")).toBeNull();
+    expect(parseChain("/a -- args")).toBeNull();
+  });
+});
+
+describe("getEffectiveArgs", () => {
+  it("uses step args when present", () => {
+    const step = { templateRef: "x", template: { content: "", models: [] }, args: ["a", "b"] };
+    expect(getEffectiveArgs(step, ["global"])).toEqual(["a", "b"]);
+  });
+
+  it("falls back to global args when step args are empty", () => {
+    const step = { templateRef: "x", template: { content: "", models: [] }, args: [] };
+    expect(getEffectiveArgs(step, ["global"])).toEqual(["global"]);
+  });
+});
 
 describe("Boomerang Extension", () => {
+  let tempRoot: string;
+  let homeDir: string;
+  let projectDir: string;
+  let currentCwd: string;
+  let currentLeafId: string | null;
+  let currentModel: { provider: string; id: string };
+  let currentThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  let allModels: { provider: string; id: string }[];
+  let availableModels: { provider: string; id: string }[];
+  let switchFailures: Set<string>;
+
   let handlers: Map<string, Function[]>;
   let commands: Map<string, { description: string; handler: Function }>;
-  let tools: Map<string, any>;
+  let tools: Map<string, { name: string; execute: Function }>;
   let sentMessages: string[];
-  let sessionEntries: any[];
-  let navigateTreeCalls: { targetId: string; options: any }[];
-  let branchWithSummaryCalls: { targetId: string; summary: string }[];
-  let capturedSummary: any;
-  let uiMock: any;
-  let currentLeafId: string;
+  let sessionEntries: SessionEntry[];
+  let navigateTreeCalls: { targetId: string; options: { summarize?: boolean } }[];
+  let branchWithSummaryCalls: { targetId: string; summary: string; entryId: string }[];
+  let capturedSummary: { summary: { summary: string; details: { task: string } } } | undefined;
+  let setModelCalls: string[];
+  let setThinkingCalls: string[];
 
+  let uiMock: {
+    notify: ReturnType<typeof vi.fn>;
+    setStatus: ReturnType<typeof vi.fn>;
+    theme: { fg: (color: string, text: string) => string };
+  };
+  let isIdleMock: ReturnType<typeof vi.fn>;
   let mockPi: ExtensionAPI;
   let mockCtx: ExtensionContext;
   let mockCommandCtx: ExtensionCommandContext;
+
+  function model(provider: string, id: string) {
+    return { provider, id };
+  }
+
+  function modelKey(value: { provider: string; id: string }) {
+    return `${value.provider}/${value.id}`;
+  }
 
   function getCommand(name: string) {
     return commands.get(name)!.handler;
@@ -31,53 +132,155 @@ describe("Boomerang Extension", () => {
     return tools.get(name);
   }
 
-  async function setAnchor() {
-    await getCommand("boomerang")("anchor", mockCommandCtx);
+  function ensureParent(filePath: string) {
+    mkdirSync(dirname(filePath), { recursive: true });
   }
 
-  async function startBoomerang(task = "task") {
-    await getCommand("boomerang")(task, mockCommandCtx);
+  function writeFile(filePath: string, content: string) {
+    ensureParent(filePath);
+    writeFileSync(filePath, content);
   }
 
-  async function triggerAgentEnd() {
-    const handler = getHandler("agent_end");
-    if (handler) {
-      await handler({}, mockCtx);
-    }
+  function promptPath(scope: "user" | "project", ref: string) {
+    const base = scope === "project"
+      ? join(currentCwd, ".pi", "prompts")
+      : join(homeDir, ".pi", "agent", "prompts");
+    return `${join(base, ...ref.split("/"))}.md`;
   }
 
-  function addSessionEntry(id: string, entry: any) {
+  function skillPath(scope: "user" | "project", skillName: string) {
+    const base = scope === "project"
+      ? join(currentCwd, ".pi", "skills")
+      : join(homeDir, ".pi", "agent", "skills");
+    return join(base, skillName, "SKILL.md");
+  }
+
+  function writePrompt(scope: "user" | "project", ref: string, content: string) {
+    const filePath = promptPath(scope, ref);
+    writeFile(filePath, content);
+    return filePath;
+  }
+
+  function writeSkill(scope: "user" | "project", name: string, content: string) {
+    const filePath = skillPath(scope, name);
+    writeFile(filePath, content);
+    return filePath;
+  }
+
+  function makeUnreadableSkill(scope: "user" | "project", name: string) {
+    const filePath = skillPath(scope, name);
+    mkdirSync(filePath, { recursive: true });
+    return filePath;
+  }
+
+  function getConfigPath(): { dir: string; path: string } {
+    const dir = join(homeDir, ".pi", "agent");
+    return { dir, path: join(dir, "boomerang.json") };
+  }
+
+  function addSessionEntry(entry: Omit<SessionEntry, "id">, id = `entry-${sessionEntries.length}`) {
     sessionEntries.push({ id, ...entry });
     currentLeafId = id;
+    return id;
+  }
+
+  function addAssistantToolEntry(toolName: string, path?: string) {
+    return addSessionEntry({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", name: toolName, arguments: path ? { path } : {} }],
+      },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  function addAssistantTextEntry(text: string) {
+    return addSessionEntry({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text }],
+      },
+      timestamp: new Date().toISOString(),
+    });
   }
 
   function createCommandCtx(overrides: Partial<ExtensionCommandContext> = {}) {
-    return {
-      ...mockCtx,
-      navigateTree: vi.fn(async (targetId: string, options: any) => {
-        navigateTreeCalls.push({ targetId, options });
-        const handler = getHandler("session_before_tree");
-        if (handler) {
-          const result = await handler(
-            {
-              preparation: {
-                targetId,
-                oldLeafId: currentLeafId,
-                entriesToSummarize: sessionEntries.slice(1),
-                userWantsSummary: true,
-              },
+    const navigateTree = vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+      navigateTreeCalls.push({ targetId, options });
+      const handler = getHandler("session_before_tree");
+      if (handler) {
+        const startIndex = sessionEntries.findIndex((entry) => entry.id === targetId);
+        const entriesToSummarize = startIndex >= 0 ? sessionEntries.slice(startIndex + 1) : sessionEntries;
+        capturedSummary = await handler(
+          {
+            preparation: {
+              targetId,
+              oldLeafId: currentLeafId,
+              entriesToSummarize,
+              userWantsSummary: true,
             },
-            mockCtx
-          );
-          capturedSummary = result;
-        }
-        return { cancelled: false };
-      }),
+          },
+          mockCtx
+        );
+      }
+      return { cancelled: false };
+    });
+
+    return {
+      hasUI: true,
+      ui: uiMock,
+      get cwd() {
+        return currentCwd;
+      },
+      get model() {
+        return currentModel;
+      },
+      modelRegistry: mockCtx.modelRegistry,
+      isIdle: isIdleMock,
+      sessionManager: mockCtx.sessionManager,
+      navigateTree,
       ...overrides,
     } as unknown as ExtensionCommandContext;
   }
 
+  async function runBoomerang(args: string, ctx: ExtensionCommandContext = mockCommandCtx) {
+    await getCommand("boomerang")(args, ctx);
+  }
+
+  async function runCancel(ctx: ExtensionCommandContext = mockCommandCtx) {
+    await getCommand("boomerang-cancel")("", ctx);
+  }
+
+  async function fireBeforeAgentStart(systemPrompt = "original") {
+    return await getHandler("before_agent_start")({ systemPrompt }, mockCtx);
+  }
+
+  async function triggerAgentEnd(ctx: ExtensionContext = mockCtx) {
+    const handler = getHandler("agent_end");
+    if (handler) {
+      await handler({}, ctx);
+    }
+  }
+
+  async function fireSessionSwitch() {
+    await getHandler("session_switch")({}, mockCtx);
+  }
+
+  function notifyMessages() {
+    return uiMock.notify.mock.calls.map(([message, level]: [string, string]) => ({ message, level }));
+  }
+
   beforeEach(() => {
+    tempRoot = mkdtempSync(join(process.cwd(), ".tmp-boomerang-"));
+    homeDir = join(tempRoot, "home");
+    projectDir = join(tempRoot, "project");
+    mkdirSync(homeDir, { recursive: true });
+    mkdirSync(projectDir, { recursive: true });
+    currentCwd = projectDir;
+    mockState.homeDir = homeDir;
+
     handlers = new Map();
     commands = new Map();
     tools = new Map();
@@ -86,31 +289,27 @@ describe("Boomerang Extension", () => {
     navigateTreeCalls = [];
     branchWithSummaryCalls = [];
     capturedSummary = null;
-    currentLeafId = "entry-0";
+    setModelCalls = [];
+    setThinkingCalls = [];
+    switchFailures = new Set();
 
-    addSessionEntry("entry-0", {
+    currentLeafId = "entry-0";
+    currentModel = model("anthropic", "current-model");
+    currentThinking = "low";
+    allModels = [
+      currentModel,
+      model("anthropic", "claude-opus-4-6"),
+      model("anthropic", "claude-sonnet-4-20250514"),
+      model("openrouter", "claude-sonnet-4-20250514"),
+      model("openrouter", "gemini-2.5-pro"),
+    ];
+    availableModels = [...allModels];
+
+    addSessionEntry({
       type: "message",
       message: { role: "user", content: "hello", timestamp: 1000 },
       timestamp: new Date(1000).toISOString(),
-    });
-
-    mockPi = {
-      on: vi.fn((event: string, handler: Function) => {
-        if (!handlers.has(event)) handlers.set(event, []);
-        handlers.get(event)!.push(handler);
-      }),
-      registerCommand: vi.fn((name: string, options: any) => commands.set(name, options)),
-      registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
-      sendUserMessage: vi.fn((content: string) => {
-        sentMessages.push(content);
-        const id = `entry-${sessionEntries.length}`;
-        addSessionEntry(id, {
-          type: "message",
-          message: { role: "user", content, timestamp: Date.now() },
-          timestamp: new Date().toISOString(),
-        });
-      }),
-    } as unknown as ExtensionAPI;
+    }, "entry-0");
 
     uiMock = {
       notify: vi.fn(),
@@ -118,539 +317,755 @@ describe("Boomerang Extension", () => {
       theme: { fg: (color: string, text: string) => `[${color}]${text}` },
     };
 
+    isIdleMock = vi.fn(() => true);
+
     mockCtx = {
       hasUI: true,
       ui: uiMock,
-      isIdle: vi.fn(() => true),
+      get cwd() {
+        return currentCwd;
+      },
+      get model() {
+        return currentModel;
+      },
+      modelRegistry: {
+        find: (provider: string, id: string) => allModels.find((entry) => entry.provider === provider && entry.id === id),
+        getAll: () => allModels,
+        getAvailable: () => availableModels,
+      },
+      isIdle: isIdleMock,
       sessionManager: {
         getBranch: () => sessionEntries,
         getLeafId: () => currentLeafId,
-        branchWithSummary: vi.fn(async (targetId: string, summary: string) => {
-          branchWithSummaryCalls.push({ targetId, summary });
+        branchWithSummary: vi.fn((targetId: string, summary: string) => {
+          const entryId = `branch-summary-${branchWithSummaryCalls.length}`;
+          branchWithSummaryCalls.push({ targetId, summary, entryId });
+          sessionEntries.push({ id: entryId, type: "branch_summary", summary });
+          currentLeafId = entryId;
+          return entryId;
         }),
       },
     } as unknown as ExtensionContext;
 
     mockCommandCtx = createCommandCtx();
 
+    mockPi = {
+      on: vi.fn((event: string, handler: Function) => {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      }),
+      registerCommand: vi.fn((name: string, options: { description: string; handler: Function }) => commands.set(name, options)),
+      registerTool: vi.fn((tool: { name: string; execute: Function }) => tools.set(tool.name, tool)),
+      sendUserMessage: vi.fn((content: string) => {
+        sentMessages.push(content);
+        addSessionEntry({
+          type: "message",
+          message: { role: "user", content, timestamp: Date.now() },
+          timestamp: new Date().toISOString(),
+        });
+      }),
+      setModel: vi.fn(async (nextModel: { provider: string; id: string }) => {
+        setModelCalls.push(modelKey(nextModel));
+        if (switchFailures.has(modelKey(nextModel))) {
+          return false;
+        }
+        currentModel = nextModel;
+        return true;
+      }),
+      getThinkingLevel: vi.fn(() => currentThinking),
+      setThinkingLevel: vi.fn((level: typeof currentThinking) => {
+        setThinkingCalls.push(level);
+        currentThinking = level;
+      }),
+    } as unknown as ExtensionAPI;
+
     boomerangExtension(mockPi);
   });
 
-  describe("/boomerang command", () => {
-    it("rejects empty task", async () => {
-      await getCommand("boomerang")("", mockCommandCtx);
+  afterEach(() => {
+    delete globalThis.__boomerangCollapseInProgress;
+    rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  describe("validation order", () => {
+    it("rejects empty task before template processing", async () => {
+      await runBoomerang("");
+
       expect(uiMock.notify).toHaveBeenCalledWith(
-        "Usage: /boomerang <task> | anchor [clear|show]",
+        "Usage: /boomerang <task> | anchor | tool [on|off] | guidance [text|clear]",
         "error"
       );
+      expect(sentMessages).toEqual([]);
+      expect(setModelCalls).toEqual([]);
     });
 
-    it("rejects when already active", async () => {
-      await startBoomerang("task 1");
-      await getCommand("boomerang")("task 2", mockCommandCtx);
+    it("rejects an active boomerang before template processing", async () => {
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
+
+      await runBoomerang("regular task");
+      await runBoomerang("/commit fix auth");
 
       expect(uiMock.notify).toHaveBeenLastCalledWith(
         "Boomerang already active. Use /boomerang-cancel to abort.",
         "error"
       );
+      expect(setModelCalls).toEqual([]);
     });
 
-    it("rejects when agent is busy", async () => {
-      vi.mocked(mockCtx.isIdle).mockReturnValue(false);
-      await getCommand("boomerang")("task", mockCommandCtx);
-      expect(uiMock.notify).toHaveBeenLastCalledWith("Agent is busy. Wait for completion first.", "error");
-    });
+    it("rejects a busy agent before template processing", async () => {
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
+      isIdleMock.mockReturnValue(false);
 
-    it("sends task and sets status", async () => {
-      await startBoomerang("fix the bug");
-      expect(sentMessages).toContain("fix the bug");
-      expect(uiMock.setStatus).toHaveBeenCalledWith("boomerang", "[warning]boomerang");
-    });
+      await runBoomerang("/commit fix auth");
 
-    it("calls navigateTree in agent_end", async () => {
-      await startBoomerang("task");
-      await triggerAgentEnd();
-
-      expect(navigateTreeCalls).toHaveLength(1);
-      expect(navigateTreeCalls[0].options.summarize).toBe(true);
-    });
-
-    it("uses correct targetId for navigateTree", async () => {
-      const initialLeafId = currentLeafId;
-      await startBoomerang("task");
-      await triggerAgentEnd();
-
-      expect(navigateTreeCalls[0].targetId).toBe(initialLeafId);
-    });
-
-    it("clears status and notifies on success", async () => {
-      await startBoomerang("task");
-      await triggerAgentEnd();
-
-      expect(uiMock.notify).toHaveBeenLastCalledWith("Boomerang complete. Context collapsed.", "info");
-      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+      expect(uiMock.notify).toHaveBeenCalledWith("Agent is busy. Wait for completion first.", "error");
+      expect(sentMessages).toEqual([]);
+      expect(setModelCalls).toEqual([]);
     });
   });
 
-  describe("anchor commands", () => {
-    it("sets anchor", async () => {
-      await setAnchor();
-      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[cyan]anchor");
-      expect(uiMock.notify).toHaveBeenLastCalledWith(
-        "Anchor set. Subsequent boomerangs will collapse to this point.",
-        "info"
-      );
+  describe("template detection", () => {
+    it("treats /boomerang /commit as a template reference", async () => {
+      writePrompt("user", "commit", "Commit current work.");
+
+      await runBoomerang("/commit");
+
+      expect(sentMessages).toEqual(["Commit current work."]);
     });
 
-    it("clears anchor", async () => {
-      await setAnchor();
-      await getCommand("boomerang")("anchor clear", mockCommandCtx);
+    it("treats /boomerang commit as a regular task", async () => {
+      writePrompt("user", "commit", "Commit current work.");
+
+      await runBoomerang("commit");
+
+      expect(sentMessages).toEqual(["commit"]);
+      expect(setModelCalls).toEqual([]);
+    });
+
+    it("reports missing templates", async () => {
+      await runBoomerang("/nonexistent");
+
+      expect(uiMock.notify).toHaveBeenCalledWith('Template "nonexistent" not found', "error");
+      expect(sentMessages).toEqual([]);
+    });
+  });
+
+  describe("chain execution", () => {
+    it("validates all templates before starting any step", async () => {
+      writePrompt("user", "exists", "Exists: $@");
+
+      await runBoomerang("/exists -> /missing -- task");
+
+      expect(uiMock.notify).toHaveBeenCalledWith('Template "missing" not found', "error");
+      expect(sentMessages).toEqual([]);
+      expect(navigateTreeCalls).toHaveLength(0);
+    });
+
+    it("sends messages in step order with effective args", async () => {
+      writePrompt("user", "step1", "S1: $@");
+      writePrompt("user", "step2", "S2: $@");
+
+      await runBoomerang('/step1 "first" -> /step2 -- "fallback"');
+      expect(sentMessages[0]).toBe("S1: first");
+
+      await triggerAgentEnd();
+      expect(sentMessages[1]).toBe("S2: fallback");
+    });
+
+    it("collapses only after the last chain step", async () => {
+      writePrompt("user", "step1", "Step 1");
+      writePrompt("user", "step2", "Step 2");
+
+      await runBoomerang("/step1 -> /step2 -- task");
+
+      await triggerAgentEnd();
+      expect(navigateTreeCalls).toHaveLength(0);
+      expect(sentMessages).toHaveLength(2);
+
+      await triggerAgentEnd();
+      expect(navigateTreeCalls).toHaveLength(1);
+    });
+
+    it("restores to the original model after a multi-model chain", async () => {
+      currentModel = model("anthropic", "current-model");
+      writePrompt("user", "step1", "---\nmodel: claude-opus-4-6\n---\nStep one");
+      writePrompt("user", "step2", "---\nmodel: claude-sonnet-4-20250514\n---\nStep two");
+
+      await runBoomerang("/step1 -> /step2 -- task");
+      await triggerAgentEnd();
+      await triggerAgentEnd();
+
+      expect(setModelCalls).toContain("anthropic/claude-opus-4-6");
+      expect(setModelCalls).toContain("anthropic/claude-sonnet-4-20250514");
+      expect(setModelCalls[setModelCalls.length - 1]).toBe("anthropic/current-model");
+      expect(currentModel).toEqual(model("anthropic", "current-model"));
+    });
+
+    it("cancels an active chain and restores model", async () => {
+      writePrompt("user", "step1", "---\nmodel: claude-opus-4-6\n---\nStep one");
+      writePrompt("user", "step2", "Step two");
+
+      await runBoomerang("/step1 -> /step2 -- task");
+      await runCancel();
+      await triggerAgentEnd();
+
+      expect(navigateTreeCalls).toHaveLength(0);
+      expect(setModelCalls).toContain("anthropic/current-model");
+      expect(currentModel).toEqual(model("anthropic", "current-model"));
+    });
+
+    it("clears chain state on session_start", async () => {
+      writePrompt("user", "step1", "Step 1");
+      writePrompt("user", "step2", "Step 2");
+
+      await runBoomerang("/step1 -> /step2 -- task");
+      await getHandler("session_start")({}, mockCtx);
+      await triggerAgentEnd();
+
+      expect(navigateTreeCalls).toHaveLength(0);
       expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
-      expect(uiMock.notify).toHaveBeenLastCalledWith("Anchor cleared", "info");
     });
 
-    it("shows anchor status", async () => {
-      await setAnchor();
-      await getCommand("boomerang")("anchor show", mockCommandCtx);
-      expect(uiMock.notify).toHaveBeenLastCalledWith(
-        expect.stringContaining("Anchor at entry"),
-        "info"
-      );
-    });
+    it("rejects malformed chain syntax without sending a message", async () => {
+      await runBoomerang("/step1 ->");
 
-    it("blocks anchor while boomerang is active", async () => {
-      await startBoomerang("task");
-      await getCommand("boomerang")("anchor", mockCommandCtx);
-
-      expect(uiMock.notify).toHaveBeenLastCalledWith(
-        "Cannot set anchor while boomerang is active",
+      expect(uiMock.notify).toHaveBeenCalledWith(
+        "Invalid chain syntax. Use: /template [args] -> /template [args] [-- global args]",
         "error"
       );
+      expect(sentMessages).toEqual([]);
+    });
+  });
+
+  describe("template loading", () => {
+    it("loads templates from the user prompt directory", async () => {
+      writePrompt("user", "test", "From user");
+
+      await runBoomerang("/test");
+
+      expect(sentMessages).toEqual(["From user"]);
     });
 
-    it("uses anchor entry ID for navigateTree target", async () => {
-      const anchorLeafId = currentLeafId;
-      await setAnchor();
-      addSessionEntry("entry-intervene", {
-        type: "message",
-        message: { role: "user", content: "intervening" },
-      });
-      await startBoomerang("task");
-      await triggerAgentEnd();
+    it("prefers project templates over user templates", async () => {
+      writePrompt("user", "test", "From user");
+      writePrompt("project", "test", "From project");
 
-      expect(navigateTreeCalls[0].targetId).toBe(anchorLeafId);
+      await runBoomerang("/test");
+
+      expect(sentMessages).toEqual(["From project"]);
     });
 
-    it("warns when clearing anchor that does not exist", async () => {
-      await getCommand("boomerang")("anchor clear", mockCommandCtx);
-      expect(uiMock.notify).toHaveBeenCalledWith("No anchor set", "warning");
+    it("loads templates from subdirectories", async () => {
+      writePrompt("user", "sub/test", "Nested template");
+
+      await runBoomerang("/sub/test");
+
+      expect(sentMessages).toEqual(["Nested template"]);
     });
 
-    it("shows correct task count in anchor show", async () => {
-      await setAnchor();
-      await startBoomerang("task 1");
-      await triggerAgentEnd();
-      await startBoomerang("task 2");
-      await triggerAgentEnd();
-      await getCommand("boomerang")("anchor show", mockCommandCtx);
+    it("runs templates without model frontmatter", async () => {
+      writePrompt("user", "plain", "No frontmatter needed");
 
+      await runBoomerang("/plain");
+
+      expect(sentMessages).toEqual(["No frontmatter needed"]);
+      expect(setModelCalls).toEqual([]);
+    });
+
+    it("rejects invalid template refs before file lookup", async () => {
+      await runBoomerang("/../secret");
+
+      expect(uiMock.notify).toHaveBeenCalledWith('Template "../secret" not found', "error");
+      expect(sentMessages).toEqual([]);
+      expect(setModelCalls).toEqual([]);
+    });
+  });
+
+  describe("model handling", () => {
+    it("switches models when a template specifies one", async () => {
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
+
+      await runBoomerang("/commit fix auth");
+
+      expect(setModelCalls).toEqual(["anthropic/claude-opus-4-6"]);
+      expect(currentModel).toEqual(model("anthropic", "claude-opus-4-6"));
+    });
+
+    it("restores the previous model after collapse", async () => {
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
+
+      await runBoomerang("/commit fix auth");
+      await triggerAgentEnd();
+
+      expect(currentModel).toEqual(model("anthropic", "current-model"));
+      expect(uiMock.notify).toHaveBeenCalledWith("Restored to current-model", "info");
+    });
+
+    it("restores the previous model on cancel", async () => {
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
+
+      await runBoomerang("/commit fix auth");
+      await runCancel();
+
+      expect(currentModel).toEqual(model("anthropic", "current-model"));
+      expect(uiMock.notify).toHaveBeenCalledWith("Restored to current-model", "info");
+    });
+
+    it("falls back to the next model when the first switch fails", async () => {
+      writePrompt("user", "commit", "---\nmodel: openrouter/gemini-2.5-pro, claude-opus-4-6\n---\nCommit $@");
+      switchFailures.add("openrouter/gemini-2.5-pro");
+
+      await runBoomerang("/commit fix auth");
+
+      expect(setModelCalls).toEqual([
+        "openrouter/gemini-2.5-pro",
+        "anthropic/claude-opus-4-6",
+      ]);
+      expect(currentModel).toEqual(model("anthropic", "claude-opus-4-6"));
+    });
+
+    it("aborts when no models are available", async () => {
+      writePrompt("user", "commit", "---\nmodel: openrouter/gemini-2.5-pro, claude-opus-4-6\n---\nCommit $@");
+      switchFailures.add("openrouter/gemini-2.5-pro");
+      switchFailures.add("anthropic/claude-opus-4-6");
+
+      await runBoomerang("/commit fix auth");
+
+      expect(uiMock.notify).toHaveBeenCalledWith(
+        "No available model from: openrouter/gemini-2.5-pro, claude-opus-4-6",
+        "error"
+      );
+      expect(sentMessages).toEqual([]);
+    });
+
+    it("does not switch or restore when the template model is already active", async () => {
+      currentModel = model("anthropic", "claude-opus-4-6");
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
+
+      await runBoomerang("/commit fix auth");
+      await triggerAgentEnd();
+
+      expect(setModelCalls).toEqual([]);
+      expect(notifyMessages().some(({ message }) => message.includes("Restored to"))).toBe(false);
+    });
+  });
+
+  describe("skill handling", () => {
+    it("injects a resolved skill into the system prompt", async () => {
+      writePrompt("user", "commit", "---\nskill: git-workflow\n---\nCommit $@");
+      writeSkill("project", "git-workflow", "---\ndescription: Git help\n---\nUse careful git commits.");
+
+      await runBoomerang("/commit fix auth");
+      const result = await fireBeforeAgentStart();
+
+      expect(result.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(result.systemPrompt).toContain('<skill name="git-workflow">');
+      expect(result.systemPrompt).toContain("Use careful git commits.");
+      expect(uiMock.notify).toHaveBeenCalledWith('Skill "git-workflow" loaded', "info");
+    });
+
+    it("warns and continues when a skill is missing", async () => {
+      writePrompt("user", "commit", "---\nskill: missing-skill\n---\nCommit $@");
+
+      await runBoomerang("/commit fix auth");
+      const result = await fireBeforeAgentStart();
+
+      expect(uiMock.notify).toHaveBeenCalledWith('Skill "missing-skill" not found', "warning");
+      expect(sentMessages).toEqual(["Commit fix auth"]);
+      expect(result.systemPrompt).not.toContain("<skill");
+    });
+
+    it("warns and continues when a skill file cannot be read", async () => {
+      writePrompt("user", "commit", "---\nskill: broken-skill\n---\nCommit $@");
+      makeUnreadableSkill("project", "broken-skill");
+
+      await runBoomerang("/commit fix auth");
+      const result = await fireBeforeAgentStart();
+
+      expect(uiMock.notify).toHaveBeenCalledWith('Failed to read skill "broken-skill"', "warning");
+      expect(sentMessages).toEqual(["Commit fix auth"]);
+      expect(result.systemPrompt).not.toContain("<skill");
+    });
+  });
+
+  describe("thinking level handling", () => {
+    it("switches thinking levels from template frontmatter", async () => {
+      writePrompt("user", "deep-dive", "---\nthinking: xhigh\n---\nInspect $@");
+
+      await runBoomerang("/deep-dive auth");
+
+      expect(setThinkingCalls).toEqual(["xhigh"]);
+      expect(currentThinking).toBe("xhigh");
+    });
+
+    it("restores the previous thinking level after collapse", async () => {
+      writePrompt("user", "deep-dive", "---\nthinking: xhigh\n---\nInspect $@");
+
+      await runBoomerang("/deep-dive auth");
+      await triggerAgentEnd();
+
+      expect(currentThinking).toBe("low");
+      expect(uiMock.notify).toHaveBeenCalledWith("Restored to thinking:low", "info");
+    });
+
+    it("restores the previous thinking level on cancel", async () => {
+      writePrompt("user", "deep-dive", "---\nthinking: xhigh\n---\nInspect $@");
+
+      await runBoomerang("/deep-dive auth");
+      await runCancel();
+
+      expect(currentThinking).toBe("low");
+      expect(uiMock.notify).toHaveBeenCalledWith("Restored to thinking:low", "info");
+    });
+
+    it("skips thinking changes and restore when the level already matches", async () => {
+      currentThinking = "high";
+      writePrompt("user", "deep-dive", "---\nthinking: high\n---\nInspect $@");
+
+      await runBoomerang("/deep-dive auth");
+      await triggerAgentEnd();
+
+      expect(setThinkingCalls).toEqual([]);
+      expect(notifyMessages().some(({ message }) => message.includes("thinking:"))).toBe(false);
+    });
+  });
+
+  describe("argument substitution", () => {
+    it("replaces $@ with all arguments", async () => {
+      writePrompt("user", "args", "All: $@");
+
+      await runBoomerang("/args one two three");
+
+      expect(sentMessages).toEqual(["All: one two three"]);
+    });
+
+    it("replaces positional arguments", async () => {
+      writePrompt("user", "args", "$2 then $1");
+
+      await runBoomerang("/args first second");
+
+      expect(sentMessages).toEqual(["second then first"]);
+    });
+
+    it("replaces $ARGUMENTS with all arguments", async () => {
+      writePrompt("user", "args", "Args: $ARGUMENTS");
+
+      await runBoomerang("/args alpha beta");
+
+      expect(sentMessages).toEqual(["Args: alpha beta"]);
+    });
+
+    it("preserves quoted arguments", async () => {
+      writePrompt("user", "args", "$1|$2|$3");
+
+      await runBoomerang('/args "fix auth bug" module "with tests"');
+
+      expect(sentMessages).toEqual(["fix auth bug|module|with tests"]);
+    });
+
+    it("allows empty expanded templates", async () => {
+      writePrompt("user", "empty", "$1");
+
+      await runBoomerang("/empty");
+
+      expect(sentMessages).toEqual([""]);
+    });
+  });
+
+  describe("summary generation", () => {
+    it("uses the template reference instead of the expanded content in the summary", async () => {
+      writePrompt("user", "review", "Expanded prompt body");
+      addAssistantToolEntry("edit", "src/auth.ts");
+
+      await runBoomerang("/review");
+      await triggerAgentEnd();
+
+      expect(capturedSummary.summary.summary).toContain('Task: "/review"');
+      expect(capturedSummary.summary.summary).not.toContain("Expanded prompt body");
+    });
+
+    it("includes template arguments in the summary task label", async () => {
+      writePrompt("user", "commit", "Commit $@");
+
+      await runBoomerang("/commit fix the bug");
+      await triggerAgentEnd();
+
+      expect(capturedSummary.summary.summary).toContain('Task: "/commit fix the bug"');
+    });
+
+    it("includes the agent's final text in the summary as Outcome", async () => {
+      await runBoomerang("fix the auth bug");
+      addAssistantTextEntry("I completed the task successfully. The auth module is now fixed.");
+      await triggerAgentEnd();
+
+      expect(capturedSummary.summary.summary).toContain("Outcome:");
+      expect(capturedSummary.summary.summary).toContain("I completed the task successfully");
+    });
+
+    it("includes both Actions and Outcome when tools are used and text is returned", async () => {
+      await runBoomerang("fix auth");
+      addAssistantToolEntry("edit", "src/auth.ts");
+      addAssistantTextEntry("Fixed the authentication bug by updating the JWT validation.");
+      await triggerAgentEnd();
+
+      expect(capturedSummary.summary.summary).toContain("Actions:");
+      expect(capturedSummary.summary.summary).toContain("modified src/auth.ts");
+      expect(capturedSummary.summary.summary).toContain("Outcome:");
+      expect(capturedSummary.summary.summary).toContain("Fixed the authentication bug");
+    });
+
+    it("truncates long agent responses in the summary", async () => {
+      const longText = "A".repeat(600);
+      await runBoomerang("do something");
+      addAssistantTextEntry(longText);
+      await triggerAgentEnd();
+
+      expect(capturedSummary.summary.summary).toContain("Outcome:");
+      expect(capturedSummary.summary.summary).toContain("...");
+      expect(capturedSummary.summary.summary.length).toBeLessThan(650);
+    });
+
+    it("includes Config line when template switched model, thinking, or skill", async () => {
+      writePrompt("user", "full-config", "---\nmodel: claude-opus-4-6\nskill: git-workflow\nthinking: high\n---\nDo the task");
+      writeSkill("user", "git-workflow", "Git skill content");
+
+      await runBoomerang("/full-config");
+      addAssistantTextEntry("Task completed.");
+      await triggerAgentEnd();
+
+      expect(capturedSummary.summary.summary).toContain("Config:");
+      expect(capturedSummary.summary.summary).toContain("model: claude-opus-4-6");
+      expect(capturedSummary.summary.summary).toContain("thinking: high");
+      expect(capturedSummary.summary.summary).toContain("skill: git-workflow");
+    });
+  });
+
+  describe("integration behavior", () => {
+    it("works with anchor mode across multiple template tasks", async () => {
+      writePrompt("user", "commit", "Commit $@");
+      writePrompt("user", "code-review", "Review $@");
+      const anchorId = currentLeafId;
+
+      await runBoomerang("anchor");
+      await runBoomerang("/commit fix auth");
+      await triggerAgentEnd();
+      await runBoomerang("/code-review auth module");
+      await triggerAgentEnd();
+      await runBoomerang("anchor show");
+
+      expect(navigateTreeCalls[0].targetId).toBe(anchorId);
+      expect(navigateTreeCalls[1].targetId).toBe(anchorId);
       expect(uiMock.notify).toHaveBeenLastCalledWith(
         expect.stringContaining("2 task(s) completed"),
         "info"
       );
     });
-  });
 
-  describe("/boomerang-cancel", () => {
-    it("cancels active boomerang", async () => {
-      await startBoomerang("task");
-      await getCommand("boomerang-cancel")("", mockCommandCtx);
+    it("runs normally when the template model is already active", async () => {
+      currentModel = model("anthropic", "claude-opus-4-6");
+      writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
 
-      expect(uiMock.notify).toHaveBeenLastCalledWith("Boomerang cancelled", "info");
-      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
-    });
-
-    it("preserves anchor when cancelling", async () => {
-      await setAnchor();
-      await startBoomerang("task");
-      await getCommand("boomerang-cancel")("", mockCommandCtx);
-
-      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[cyan]anchor");
-    });
-
-    it("warns when no boomerang active", async () => {
-      await getCommand("boomerang-cancel")("", mockCommandCtx);
-      expect(uiMock.notify).toHaveBeenLastCalledWith("No boomerang active", "warning");
-    });
-  });
-
-  describe("before_agent_start hook", () => {
-    it("injects boomerang instructions when active", async () => {
-      await startBoomerang("task");
-
-      const result = await getHandler("before_agent_start")(
-        { systemPrompt: "original" },
-        mockCtx
-      );
-      expect(result.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
-      expect(result.systemPrompt).toContain("original");
-    });
-
-    it("does nothing when not active", async () => {
-      const result = await getHandler("before_agent_start")(
-        { systemPrompt: "original" },
-        mockCtx
-      );
-      expect(result).toBeUndefined();
-    });
-  });
-
-  describe("session_before_tree hook", () => {
-    it("provides custom summary when boomerang collapse is pending", async () => {
-      addSessionEntry("work-1", {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", name: "edit", arguments: { path: "src/auth.ts" } }],
-        },
-      });
-
-      await getCommand("boomerang")("fix the bug", mockCommandCtx);
+      await runBoomerang("/commit fix auth");
       await triggerAgentEnd();
 
-      expect(capturedSummary).toBeDefined();
-      expect(capturedSummary.summary.summary).toContain("BOOMERANG COMPLETE");
-      expect(capturedSummary.summary.summary).toContain("fix the bug");
-      expect(capturedSummary.summary.summary).toContain("Modified src/auth.ts");
+      expect(sentMessages).toEqual(["Commit fix auth"]);
+      expect(navigateTreeCalls).toHaveLength(1);
+      expect(currentModel).toEqual(model("anthropic", "claude-opus-4-6"));
     });
 
-    it("does nothing when no boomerang pending", async () => {
-      const handler = getHandler("session_before_tree");
-      const result = await handler(
-        { preparation: { entriesToSummarize: [] } },
-        mockCtx
-      );
-      expect(result).toBeUndefined();
-    });
-
-    it("accumulates summaries in anchor mode", async () => {
-      await setAnchor();
-
-      addSessionEntry("work-1", {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", name: "edit", arguments: { path: "file1.ts" } }],
-        },
-      });
-      await startBoomerang("task 1");
-      await triggerAgentEnd();
-
-      addSessionEntry("work-2", {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", name: "edit", arguments: { path: "file2.ts" } }],
-        },
-      });
-      await startBoomerang("task 2");
-      await triggerAgentEnd();
-
-      expect(capturedSummary.summary.summary).toContain("task 1");
-      expect(capturedSummary.summary.summary).toContain("task 2");
-    });
-  });
-
-  describe("navigateTree error handling", () => {
-    it("notifies and cleans up when navigateTree fails", async () => {
-      const failCtx = createCommandCtx({
-        navigateTree: vi.fn(async () => {
-          throw new Error("navigation failed");
+    it("sets the global collapse flag during template collapse", async () => {
+      writePrompt("user", "commit", "Commit $@");
+      let flagDuringNavigation: boolean | undefined;
+      const trackingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          flagDuringNavigation = globalThis.__boomerangCollapseInProgress;
+          navigateTreeCalls.push({ targetId, options });
+          return { cancelled: false };
         }),
       });
 
-      await getCommand("boomerang")("task", failCtx);
+      await runBoomerang("/commit fix auth", trackingCtx);
       await triggerAgentEnd();
+
+      expect(flagDuringNavigation).toBe(true);
+      expect(globalThis.__boomerangCollapseInProgress).toBeFalsy();
+    });
+
+    it("restores model and thinking when the session switches mid-boomerang", async () => {
+      writePrompt("user", "deep-dive", "---\nmodel: claude-opus-4-6\nthinking: xhigh\n---\nInspect $@");
+
+      await runBoomerang("/deep-dive auth");
+      await fireSessionSwitch();
+
+      expect(currentModel).toEqual(model("anthropic", "current-model"));
+      expect(currentThinking).toBe("low");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+      expect(uiMock.notify).toHaveBeenCalledWith("Restored to current-model, thinking:low", "info");
+    });
+  });
+
+  describe("tool enable and disable", () => {
+    it("keeps the tool disabled by default", async () => {
+      const result = await getTool("boomerang").execute("id", {}, undefined, undefined, mockCtx);
+
+      expect(result.content[0].text).toContain("Boomerang tool is disabled");
+    });
+
+    it("enables the tool with /boomerang tool on", async () => {
+      await runBoomerang("tool on");
+      const result = await getTool("boomerang").execute("id", {}, undefined, undefined, mockCtx);
 
       expect(uiMock.notify).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to collapse"),
-        "error"
+        "Boomerang tool enabled. Agent can now use boomerang().",
+        "info"
       );
-      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+      expect(result.content[0].text).toContain("anchor set");
     });
 
-    it("handles cancelled navigation", async () => {
-      const cancelCtx = createCommandCtx({
-        navigateTree: vi.fn(async () => ({ cancelled: true })),
-      });
+    it("disables the tool with /boomerang tool off", async () => {
+      await runBoomerang("tool on");
+      await runBoomerang("tool off");
+      const result = await getTool("boomerang").execute("id", {}, undefined, undefined, mockCtx);
 
-      await getCommand("boomerang")("task", cancelCtx);
-      await triggerAgentEnd();
-
-      expect(uiMock.notify).toHaveBeenLastCalledWith("Collapse cancelled", "warning");
+      expect(uiMock.notify).toHaveBeenCalledWith("Boomerang tool disabled.", "info");
+      expect(result.content[0].text).toContain("Boomerang tool is disabled");
     });
 
-    it("does not persist anchor summary when navigateTree fails", async () => {
-      await setAnchor();
+    it("shows the current tool status with /boomerang tool", async () => {
+      await runBoomerang("tool on");
+      await runBoomerang("tool");
 
-      const failCtx = createCommandCtx({
-        navigateTree: vi.fn(async () => {
-          throw new Error("fail");
-        }),
-      });
-
-      await getCommand("boomerang")("task 1", failCtx);
-      await triggerAgentEnd();
-
-      addSessionEntry("work-2", {
-        type: "message",
-        message: {
-          role: "assistant",
-          content: [{ type: "toolCall", name: "edit", arguments: { path: "file2.ts" } }],
-        },
-      });
-      await startBoomerang("task 2");
-      await triggerAgentEnd();
-
-      expect(capturedSummary.summary.summary).toContain("task 2");
-      expect(capturedSummary.summary.summary).not.toContain("task 1");
+      expect(uiMock.notify).toHaveBeenLastCalledWith("Boomerang tool is enabled", "info");
     });
-  });
 
-  describe("boomerang tool", () => {
-    it("sets anchor on first call", async () => {
-      const tool = getTool("boomerang");
-      const result = await tool.execute("id", {}, undefined, undefined, mockCtx);
+    it("preserves tool state across session switches", async () => {
+      await runBoomerang("tool on");
+      await fireSessionSwitch();
+      const result = await getTool("boomerang").execute("id", {}, undefined, undefined, mockCtx);
 
       expect(result.content[0].text).toContain("anchor set");
     });
 
-    it("returns error if no session entries", async () => {
-      sessionEntries.length = 0;
-      currentLeafId = "";
-      const noLeafCtx = {
-        ...mockCtx,
-        sessionManager: {
-          ...mockCtx.sessionManager,
-          getLeafId: () => null,
-        },
-      };
+    it("accepts inline guidance with tool on", async () => {
+      await runBoomerang('tool on Use only for refactoring tasks');
 
-      const tool = getTool("boomerang");
-      const result = await tool.execute("id", {}, undefined, undefined, noLeafCtx);
-
-      expect(result.isError).toBe(true);
-      expect(result.content[0].text).toContain("no session entries");
-    });
-
-    it("queues collapse on second call", async () => {
-      const tool = getTool("boomerang");
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      const result = await tool.execute("id", {}, undefined, undefined, mockCtx);
-
-      expect(result.content[0].text).toContain("Context will collapse");
-    });
-
-    it("uses branchWithSummary when no command context stored", async () => {
-      const tool = getTool("boomerang");
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      await triggerAgentEnd();
-
-      expect(branchWithSummaryCalls).toHaveLength(1);
       expect(uiMock.notify).toHaveBeenCalledWith(
-        expect.stringContaining("Context collapsed"),
+        'Boomerang tool enabled with guidance: "Use only for refactoring tasks"',
         "info"
       );
     });
 
-    it("uses navigateTree when command context is stored", async () => {
-      // First run a command to store context
-      await setAnchor();
+    it("strips quotes from inline guidance", async () => {
+      await runBoomerang('tool on "Use for multi-file changes"');
 
-      const tool = getTool("boomerang");
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      await triggerAgentEnd();
-
-      expect(navigateTreeCalls).toHaveLength(1);
-      expect(branchWithSummaryCalls).toHaveLength(0);
+      expect(uiMock.notify).toHaveBeenCalledWith(
+        'Boomerang tool enabled with guidance: "Use for multi-file changes"',
+        "info"
+      );
     });
 
-    it("is disabled during active command boomerang", async () => {
-      await startBoomerang("task");
+    it("keeps existing guidance when re-enabling without new guidance", async () => {
+      await runBoomerang('tool on Original guidance');
+      await runBoomerang('tool off');
+      await runBoomerang('tool on');
+      await runBoomerang('tool');
 
-      const tool = getTool("boomerang");
-      const result = await tool.execute("id", {}, undefined, undefined, mockCtx);
-
-      expect(result.content[0].text).toContain("Command boomerang is active");
-    });
-
-    it("does not include command anchor summaries in tool collapse", async () => {
-      // Set command anchor and do a command boomerang
-      await setAnchor();
-      await startBoomerang("command task");
-      await triggerAgentEnd();
-
-      // Now use the tool - should NOT include command anchor summaries
-      const tool = getTool("boomerang");
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      await tool.execute("id", {}, undefined, undefined, mockCtx);
-      await triggerAgentEnd();
-
-      // The last summary should only contain the tool task, not the command task
-      expect(capturedSummary.summary.summary).toContain("Agent-initiated task");
-      expect(capturedSummary.summary.summary).not.toContain("command task");
+      expect(uiMock.notify).toHaveBeenLastCalledWith(
+        'Boomerang tool is enabled | Guidance: "Original guidance"',
+        "info"
+      );
     });
   });
 
-  describe("summary extraction", () => {
-    async function getSummaryForEntries(entries: any[]) {
-      for (const entry of entries) {
-        sessionEntries.push(entry);
-      }
+  describe("guidance subcommand", () => {
+    it("sets guidance with /boomerang guidance", async () => {
+      await runBoomerang('guidance Use for complex refactoring');
 
-      await startBoomerang("task");
-      await triggerAgentEnd();
-      return capturedSummary?.summary?.summary;
-    }
-
-    it("extracts file operations from tool calls", async () => {
-      const entries = [
-        {
-          id: "e1",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "read", arguments: { path: "file1.ts" } }],
-          },
-        },
-        {
-          id: "e2",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "edit", arguments: { path: "file2.ts" } }],
-          },
-        },
-        {
-          id: "e3",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "bash", arguments: { command: "npm test" } }],
-          },
-        },
-      ];
-
-      const summary = await getSummaryForEntries(entries);
-      expect(summary).toContain("Read 1 file(s)");
-      expect(summary).toContain("modified file2.ts");
-      expect(summary).toContain("ran 1 command(s)");
+      expect(uiMock.notify).toHaveBeenCalledWith(
+        'Guidance set: "Use for complex refactoring"',
+        "info"
+      );
     });
 
-    it("extracts write tool calls", async () => {
-      const entries = [
-        {
-          id: "e1",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "write", arguments: { path: "new-file.ts" } }],
-          },
-        },
-      ];
+    it("shows current guidance with /boomerang guidance show", async () => {
+      await runBoomerang('guidance Some guidance text');
+      await runBoomerang('guidance show');
 
-      const summary = await getSummaryForEntries(entries);
-      expect(summary).toContain("Modified new-file.ts");
+      expect(uiMock.notify).toHaveBeenLastCalledWith(
+        'Current guidance: "Some guidance text"',
+        "info"
+      );
     });
 
-    it("deduplicates repeated file operations", async () => {
-      const entries = [
-        {
-          id: "e1",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "read", arguments: { path: "same.ts" } }],
-          },
-        },
-        {
-          id: "e2",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "read", arguments: { path: "same.ts" } }],
-          },
-        },
-      ];
+    it("shows no guidance message when none set", async () => {
+      await runBoomerang('guidance');
 
-      const summary = await getSummaryForEntries(entries);
-      expect(summary).toContain("Read 1 file(s)");
+      expect(uiMock.notify).toHaveBeenCalledWith(
+        "No guidance set. Use `/boomerang guidance <text>` to set.",
+        "info"
+      );
     });
 
-    it("reports no file operations when agent uses no tools", async () => {
-      const entries = [
-        {
-          id: "e1",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "Done." }],
-          },
-        },
-      ];
+    it("clears guidance with /boomerang guidance clear", async () => {
+      await runBoomerang('guidance Some guidance');
+      await runBoomerang('guidance clear');
 
-      const summary = await getSummaryForEntries(entries);
-      expect(summary).toContain("No file operations recorded");
+      expect(uiMock.notify).toHaveBeenLastCalledWith("Guidance cleared.", "info");
     });
 
-    it("extracts multiple tool calls from single message", async () => {
-      const entries = [
-        {
-          id: "e1",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [
-              { type: "toolCall", name: "read", arguments: { path: "file1.ts" } },
-              { type: "toolCall", name: "edit", arguments: { path: "file2.ts" } },
-              { type: "toolCall", name: "bash", arguments: { command: "npm test" } },
-            ],
-          },
-        },
-      ];
+    it("injects guidance into system prompt when tool is enabled", async () => {
+      await runBoomerang('tool on');
+      await runBoomerang('guidance Use for tasks that modify 3+ files');
 
-      const summary = await getSummaryForEntries(entries);
-      expect(summary).toContain("Read 1 file(s)");
-      expect(summary).toContain("modified file2.ts");
-      expect(summary).toContain("ran 1 command(s)");
+      const result = await fireBeforeAgentStart("original prompt");
+
+      expect(result?.systemPrompt).toContain("Use for tasks that modify 3+ files");
     });
 
-    it("capitalizes the first word of the result", async () => {
-      const entries = [
-        {
-          id: "e1",
-          type: "message",
-          message: {
-            role: "assistant",
-            content: [{ type: "toolCall", name: "read", arguments: { path: "file.ts" } }],
-          },
-        },
-      ];
+    it("uses default guidance when tool enabled without custom guidance", async () => {
+      await runBoomerang('tool on');
 
-      const summary = await getSummaryForEntries(entries);
-      expect(summary).toMatch(/Result: Read/);
+      const result = await fireBeforeAgentStart("original prompt");
+
+      expect(result?.systemPrompt).toContain("boomerang tool is available");
+      expect(result?.systemPrompt).toContain("large, multi-step tasks");
+    });
+
+    it("does not inject guidance when tool is disabled", async () => {
+      await runBoomerang('guidance Some guidance');
+
+      const result = await fireBeforeAgentStart("original prompt");
+
+      expect(result).toBeUndefined();
     });
   });
 
-  describe("session lifecycle", () => {
-    it.each(["session_start", "session_switch"])("clears state on %s", async (event) => {
-      await setAnchor();
-      await startBoomerang("task");
-      await getHandler(event)({}, mockCtx);
+  describe("config persistence", () => {
+    it("persists tool enabled state to config file", async () => {
+      await runBoomerang('tool on');
 
-      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+      const { path } = getConfigPath();
+      const config = JSON.parse(readFileSync(path, "utf-8"));
+      expect(config.toolEnabled).toBe(true);
+    });
+
+    it("persists guidance to config file", async () => {
+      await runBoomerang('guidance My custom guidance');
+
+      const { path } = getConfigPath();
+      const config = JSON.parse(readFileSync(path, "utf-8"));
+      expect(config.toolGuidance).toBe("My custom guidance");
+    });
+
+    it("loads config on extension init", async () => {
+      const { dir, path } = getConfigPath();
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path, JSON.stringify({ toolEnabled: true, toolGuidance: "Persisted guidance" }));
+
+      boomerangExtension(mockPi);
+
+      const result = await getTool("boomerang").execute("id", {}, undefined, undefined, mockCtx);
+      expect(result.content[0].text).toContain("anchor set");
     });
   });
 });
