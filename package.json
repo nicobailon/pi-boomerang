@@ -3,12 +3,10 @@
   "version": "0.2.0",
   "description": "Token-efficient autonomous task execution with context collapse",
   "type": "module",
-  "files": [
-    "index.ts",
-    "README.md",
-    "CHANGELOG.md",
-    "banner.png"
-  ],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": ["index.ts", "README.md", "CHANGELOG.md", "banner.png"],
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest"
