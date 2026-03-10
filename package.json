@@ -1,6 +1,6 @@
 {
   "name": "pi-boomerang",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Token-efficient autonomous task execution with context collapse",
   "type": "module",
   "pi": {
@@ -8,6 +8,7 @@
       "./index.ts"
     ]
   },
+  "keywords": ["pi-package"],
   "files": [
     "index.ts",
     "README.md",
