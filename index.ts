@@ -47,6 +47,155 @@ function saveConfig(config: BoomerangConfig): void {
   }
 }
 
+/**
+ * Parse loop count and --converge flag from a raw task string.
+ * 
+ * Operates on raw strings with quote-aware boundary detection.
+ * Splits around first standalone `--` (preserving chain global args).
+ * Only scans the main segment (before `--`) for loop tokens.
+ * 
+ * Returns { task, loopCount, converge } or null if no Nx token found.
+ */
+export function extractLoopCount(task: string): {
+  task: string;
+  loopCount: number;
+  converge: boolean;
+} | null {
+  if (!task) return null;
+
+  // Find the first standalone -- separator (for chain global args)
+  let mainSegmentEnd = task.length;
+  let inQuote: string | null = null;
+  let doubleDashPos = -1;
+
+  for (let i = 0; i < task.length; i++) {
+    const char = task[i];
+
+    if (inQuote) {
+      if (char === inQuote && (i === 0 || task[i - 1] !== "\\")) {
+        inQuote = null;
+      }
+    } else if (char === '"' || char === "'") {
+      inQuote = char;
+    } else if (char === "-" && i + 1 < task.length && task[i + 1] === "-") {
+      // Found --, check if it's standalone (surrounded by whitespace or start/end)
+      const before = i === 0 || /\s/.test(task[i - 1]);
+      const after = i + 2 >= task.length || /\s/.test(task[i + 2]);
+      if (before && after) {
+        doubleDashPos = i;
+        mainSegmentEnd = i;
+        break;
+      }
+    }
+  }
+
+  // Extract main segment and global args
+  const mainSegment = task.slice(0, mainSegmentEnd).trim();
+  if (!mainSegment) return null;
+
+  // Parse main segment for loop tokens
+  let loopCount: number | null = null;
+  let converge = false;
+  const tokensToRemove: Array<{ start: number; end: number }> = [];
+
+  // Find standalone tokens in main segment (Nx and --converge)
+  let i = 0;
+  while (i < mainSegment.length) {
+    // Skip quoted content
+    if (mainSegment[i] === '"' || mainSegment[i] === "'") {
+      const quote = mainSegment[i];
+      i++;
+      while (i < mainSegment.length && mainSegment[i] !== quote) {
+        if (mainSegment[i] === "\\" && i + 1 < mainSegment.length) {
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      if (i < mainSegment.length) i++; // Skip closing quote
+      continue;
+    }
+
+    // Skip whitespace
+    if (/\s/.test(mainSegment[i])) {
+      i++;
+      continue;
+    }
+
+    // Found a non-whitespace, non-quote character - start of a token
+    const tokenStart = i;
+    while (i < mainSegment.length && !/\s/.test(mainSegment[i])) {
+      i++;
+    }
+    const tokenEnd = i;
+    const token = mainSegment.slice(tokenStart, tokenEnd);
+
+    // Check for Nx pattern (1-999x)
+    const loopMatch = token.match(/^\d{1,3}x$/);
+    if (loopMatch) {
+      const num = parseInt(token.slice(0, -1), 10);
+      if (num >= 1 && num <= 999 && loopCount === null) {
+        loopCount = num;
+        tokensToRemove.push({ start: tokenStart, end: tokenEnd });
+      }
+    }
+
+    // Check for --converge
+    if (token === "--converge" && !converge) {
+      converge = true;
+      tokensToRemove.push({ start: tokenStart, end: tokenEnd });
+    }
+  }
+
+  if (loopCount === null) return null;
+
+  // Remove tokens by character position, preserving everything else
+  // Sort removals by position (descending) to maintain indices
+  tokensToRemove.sort((a, b) => b.start - a.start);
+
+  let cleanedMain = mainSegment;
+  for (const { start, end } of tokensToRemove) {
+    cleanedMain = cleanedMain.slice(0, start) + cleanedMain.slice(end);
+  }
+
+  // Trim and reconstruct with global args if present
+  const cleanedTask = cleanedMain.trim();
+  let result = cleanedTask;
+  if (doubleDashPos >= 0) {
+    const globalArgs = task.slice(mainSegmentEnd).trim();
+    result = `${cleanedTask} ${globalArgs}`.trim();
+  }
+
+  return {
+    task: result,
+    loopCount,
+    converge,
+  };
+}
+
+/**
+ * Detect if an iteration made file changes.
+ * 
+ * Returns true if any write or edit tool calls are found.
+ * Returns false if only read/bash calls or no tool calls.
+ * Uses same entry filtering as generateSummaryFromEntries.
+ */
+export function didIterationMakeChanges(entries: SessionEntry[]): boolean {
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const msg = entry.message;
+    if (msg.role !== "assistant") continue;
+
+    for (const block of (msg as AssistantMessage).content) {
+      if (block.type !== "toolCall") continue;
+      if (block.name === "write" || block.name === "edit") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 const BOOMERANG_INSTRUCTIONS = `BOOMERANG MODE ACTIVE
 
 You are in boomerang mode - a token-efficient execution mode where:
@@ -88,6 +237,21 @@ interface ChainState {
     thinking?: ThinkingLevel;
     skill?: string;
   }>;
+}
+
+interface LoopState {
+  loopCount: number;
+  currentIteration: number;
+  stoppedEarly: boolean;
+  autoAnchorId: string;
+  iterationSummaries: string[];
+  convergenceEnabled: boolean;
+  baseTask: string;
+  isChain: boolean;
+  templateRef?: string;
+  templateArgs?: string[];
+  commandCtx: ExtensionCommandContext;
+  lastIterationHadChanges: boolean | null;
 }
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -205,6 +369,7 @@ export default function (pi: ExtensionAPI) {
   let previousModel: Model<any> | undefined = undefined;
   let previousThinking: ThinkingLevel | undefined = undefined;
   let chainState: ChainState | null = null;
+  let loopState: LoopState | null = null;
 
   function parseFrontmatter(content: string): { frontmatter: Record<string, string>; content: string } {
     const frontmatter: Record<string, string> = {};
@@ -405,6 +570,7 @@ export default function (pi: ExtensionAPI) {
     previousModel = undefined;
     previousThinking = undefined;
     chainState = null;
+    loopState = null;
   }
 
   function clearTaskState() {
@@ -549,9 +715,151 @@ export default function (pi: ExtensionAPI) {
     pi.sendUserMessage(expandedContent);
   }
 
+  async function restartChainForLoop(ctx: ExtensionContext): Promise<void> {
+    if (!loopState) return;
+
+    const parsed = parseChain(loopState.baseTask);
+    if (!parsed) {
+      ctx.ui.notify("Invalid chain syntax", "error");
+      await restoreModelAndThinking(ctx);
+      clearTaskState();
+      loopState = null;
+      updateStatus(ctx);
+      return;
+    }
+
+    const resolvedSteps: ChainStep[] = [];
+    for (const step of parsed.steps) {
+      const template = loadTemplate(step.templateRef, loopState.commandCtx.cwd);
+      if (!template) {
+        ctx.ui.notify(`Template "${step.templateRef}" not found`, "error");
+        await restoreModelAndThinking(ctx);
+        clearTaskState();
+        loopState = null;
+        updateStatus(ctx);
+        return;
+      }
+      resolvedSteps.push({
+        templateRef: step.templateRef,
+        template,
+        args: step.args,
+      });
+    }
+
+    const stepNames = resolvedSteps.map((s) => `/${s.templateRef}`).join(" -> ");
+    const taskDisplayName = `${stepNames} (${resolvedSteps.length} steps)`;
+
+    chainState = {
+      steps: resolvedSteps,
+      globalArgs: parsed.globalArgs,
+      currentIndex: 0,
+      targetId: loopState.autoAnchorId,
+      taskDisplayName,
+      commandCtx: loopState.commandCtx,
+      configHistory: [],
+    };
+
+    updateStatus(ctx);
+    ctx.ui.notify(`Chain iteration ${loopState.currentIteration}/${loopState.loopCount} started`, "info");
+
+    await executeChainStep(ctx);
+  }
+
+  async function executeLoopIteration(ctx: ExtensionContext): Promise<void> {
+    if (!loopState) return;
+
+    if (loopState.isChain) {
+      await restartChainForLoop(ctx);
+      return;
+    }
+
+    if (loopState.templateRef) {
+      const template = loadTemplate(loopState.templateRef, loopState.commandCtx.cwd);
+      if (!template) {
+        ctx.ui.notify(`Template "${loopState.templateRef}" not found`, "error");
+        await restoreModelAndThinking(ctx);
+        clearTaskState();
+        loopState = null;
+        updateStatus(ctx);
+        return;
+      }
+
+      let switchedToModel: string | undefined;
+      let switchedToThinking: ThinkingLevel | undefined;
+      let injectedSkill: string | undefined;
+
+      if (template.models.length > 0) {
+        const result = await resolveAndSwitchModel(template.models, ctx);
+        if (!result) {
+          await restoreModelAndThinking(ctx);
+          clearTaskState();
+          loopState = null;
+          updateStatus(ctx);
+          return;
+        }
+        if (!result.alreadyActive) {
+          switchedToModel = result.model.id;
+        }
+      }
+
+      if (template.thinking) {
+        const currentThinking = pi.getThinkingLevel();
+        if (template.thinking !== currentThinking) {
+          pi.setThinkingLevel(template.thinking);
+          switchedToThinking = template.thinking;
+        }
+      }
+
+      if (template.skill) {
+        const skillPath = resolveSkillPath(template.skill, loopState.commandCtx.cwd);
+        if (skillPath) {
+          const skillContent = readSkillContent(skillPath);
+          if (skillContent) {
+            pendingSkill = { name: template.skill, content: skillContent };
+            injectedSkill = template.skill;
+          }
+        }
+      }
+
+      const expandedContent = substituteArgs(template.content, loopState.templateArgs || []);
+      const taskDisplayName = loopState.templateArgs && loopState.templateArgs.length > 0
+        ? `/${loopState.templateRef} ${loopState.templateArgs.join(" ")}`.slice(0, 80)
+        : `/${loopState.templateRef}`;
+
+      pendingCollapse = {
+        targetId: loopState.autoAnchorId,
+        task: taskDisplayName,
+        commandCtx: loopState.commandCtx,
+        switchedToModel,
+        switchedToThinking,
+        injectedSkill,
+      };
+
+      updateStatus(ctx);
+      pi.sendUserMessage(expandedContent);
+      return;
+    }
+
+    // Plain task path
+    pendingCollapse = {
+      targetId: loopState.autoAnchorId,
+      task: loopState.baseTask,
+      commandCtx: loopState.commandCtx,
+    };
+
+    updateStatus(ctx);
+    pi.sendUserMessage(loopState.baseTask);
+  }
+
   function updateStatus(ctx: ExtensionContext) {
     if (!ctx.hasUI) return;
-    if (chainState) {
+    if (loopState && chainState) {
+      const loopProgress = `loop ${loopState.currentIteration}/${loopState.loopCount}`;
+      const chainProgress = `chain ${chainState.currentIndex + 1}/${chainState.steps.length}`;
+      ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("warning", `${loopProgress} · ${chainProgress}`));
+    } else if (loopState) {
+      ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("warning", `loop ${loopState.currentIteration}/${loopState.loopCount}`));
+    } else if (chainState) {
       const progress = `${chainState.currentIndex + 1}/${chainState.steps.length}`;
       ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("warning", `chain ${progress}`));
     } else if (boomerangActive) {
@@ -569,7 +877,12 @@ export default function (pi: ExtensionAPI) {
     injectedSkill?: string;
   }
 
-  function generateSummaryFromEntries(entries: SessionEntry[], task: string, config?: SummaryConfig): string {
+  function generateSummaryFromEntries(
+    entries: SessionEntry[],
+    task: string,
+    config?: SummaryConfig,
+    loopInfo?: { iteration: number; totalIterations: number }
+  ): string {
     const filesRead = new Set<string>();
     const filesWritten = new Set<string>();
     let commandCount = 0;
@@ -596,7 +909,10 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    let summary = `[BOOMERANG COMPLETE]\nTask: "${task}"`;
+    const headerLabel = loopInfo
+      ? `[BOOMERANG COMPLETE - LOOP ${loopInfo.iteration}/${loopInfo.totalIterations}]`
+      : `[BOOMERANG COMPLETE]`;
+    let summary = `${headerLabel}\nTask: "${task}"`;
 
     const configParts: string[] = [];
     if (config?.switchedToModel) configParts.push(`model: ${config.switchedToModel}`);
@@ -735,6 +1051,96 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Extract loop count and --converge flag
+      const loopExtracted = extractLoopCount(trimmed);
+      if (!loopExtracted) {
+        // No loop specified, proceed normally
+      } else {
+        // Loop requested
+        const startEntryId = ctx.sessionManager.getLeafId();
+        if (!startEntryId && !anchorEntryId) {
+          ctx.ui.notify("No session entry to start from", "error");
+          return;
+        }
+
+        // Set auto-anchor at current leaf
+        const autoAnchorId = anchorEntryId ?? startEntryId!;
+
+        // Save model/thinking once for entire loop
+        previousModel = ctx.model;
+        previousThinking = pi.getThinkingLevel();
+
+        // Clear task state but keep loop-relevant fields
+        toolAnchorEntryId = null;
+        toolCollapsePending = false;
+        pendingCollapse = null;
+        lastTaskSummary = null;
+        chainState = null;
+
+        // Determine task type
+        const taskString = loopExtracted.task;
+        const chainParsed = parseChain(taskString);
+        const isTemplate = taskString.startsWith("/");
+
+        if (chainParsed) {
+          // Chain loop
+          loopState = {
+            loopCount: loopExtracted.loopCount,
+            currentIteration: 1,
+            stoppedEarly: false,
+            autoAnchorId,
+            iterationSummaries: [],
+            convergenceEnabled: loopExtracted.converge,
+            baseTask: taskString,
+            isChain: true,
+            commandCtx: ctx,
+            lastIterationHadChanges: null,
+          };
+        } else if (isTemplate) {
+          // Template loop
+          const spaceIndex = taskString.indexOf(" ");
+          const templateRef = spaceIndex > 0 ? taskString.slice(1, spaceIndex) : taskString.slice(1);
+          const templateArgsStr = spaceIndex > 0 ? taskString.slice(spaceIndex + 1) : "";
+          const templateArgs = parseCommandArgs(templateArgsStr);
+
+          loopState = {
+            loopCount: loopExtracted.loopCount,
+            currentIteration: 1,
+            stoppedEarly: false,
+            autoAnchorId,
+            iterationSummaries: [],
+            convergenceEnabled: loopExtracted.converge,
+            baseTask: taskString,
+            isChain: false,
+            templateRef,
+            templateArgs,
+            commandCtx: ctx,
+            lastIterationHadChanges: null,
+          };
+        } else {
+          // Plain task loop
+          loopState = {
+            loopCount: loopExtracted.loopCount,
+            currentIteration: 1,
+            stoppedEarly: false,
+            autoAnchorId,
+            iterationSummaries: [],
+            convergenceEnabled: loopExtracted.converge,
+            baseTask: taskString,
+            isChain: false,
+            commandCtx: ctx,
+            lastIterationHadChanges: null,
+          };
+        }
+
+        boomerangActive = true;
+        updateStatus(ctx);
+        ctx.ui.notify(`Loop started: ${loopExtracted.loopCount} iterations`, "info");
+
+        await executeLoopIteration(ctx);
+        return;
+      }
+
       const chainParsed = parseChain(trimmed);
       if (chainParsed) {
         await handleChain(chainParsed, ctx);
@@ -860,6 +1266,7 @@ export default function (pi: ExtensionAPI) {
 
       await restoreModelAndThinking(ctx);
       clearTaskState();
+      loopState = null;
       toolAnchorEntryId = null;
       toolCollapsePending = false;
       updateStatus(ctx);
@@ -938,6 +1345,10 @@ export default function (pi: ExtensionAPI) {
 
     if (boomerangActive) {
       systemPrompt += "\n\n" + BOOMERANG_INSTRUCTIONS;
+
+      if (loopState) {
+        systemPrompt += `\n\nLOOP ITERATION ${loopState.currentIteration}/${loopState.loopCount}\nYou are on iteration ${loopState.currentIteration} of ${loopState.loopCount} in a loop. Previous iterations made changes that are already applied to the codebase. Build on that work — do not repeat what was already done. Focus on what remains to improve.`;
+      }
 
       if (pendingSkill) {
         ctx.ui.notify(`Skill "${pendingSkill.name}" loaded`, "info");
@@ -1021,7 +1432,10 @@ export default function (pi: ExtensionAPI) {
       if (result.cancelled) {
         ctx.ui.notify("Collapse cancelled", "warning");
       } else {
-        if (anchorEntryId !== null && targetId === anchorEntryId && lastTaskSummary) {
+        // Loop accumulation (precedence: loop > user-anchor)
+        if (loopState && lastTaskSummary) {
+          loopState.iterationSummaries.push(lastTaskSummary);
+        } else if (anchorEntryId !== null && targetId === anchorEntryId && lastTaskSummary) {
           anchorSummaries.push(lastTaskSummary);
         }
         ctx.ui.notify("Boomerang complete. Context collapsed.", "info");
@@ -1030,6 +1444,51 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`Failed to collapse: ${err}`, "error");
     } finally {
       globalThis.__boomerangCollapseInProgress = false;
+    }
+
+    // Handle loop iteration transitions (after collapse completes)
+    if (loopState) {
+      // Loop summary has already been recorded in the collapse block above
+
+      // Check if we should continue
+      const isLastIteration = loopState.currentIteration === loopState.loopCount;
+      const hasConverged =
+        loopState.convergenceEnabled && loopState.lastIterationHadChanges === false;
+
+      if (isLastIteration || hasConverged) {
+        // Finalize loop
+        if (hasConverged) {
+          loopState.stoppedEarly = true;
+          ctx.ui.notify(
+            `Loop converged at iteration ${loopState.currentIteration}/${loopState.loopCount}`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            `Loop completed: ${loopState.loopCount}/${loopState.loopCount} iterations`,
+            "info"
+          );
+        }
+
+        await restoreModelAndThinking(ctx);
+        boomerangActive = false;
+        loopState = null;
+        pendingCollapse = null;
+        lastTaskSummary = null;
+        pendingSkill = null;
+        updateStatus(ctx);
+        return;
+      }
+
+      // Continue to next iteration
+      loopState.currentIteration++;
+      lastTaskSummary = null;
+      pendingCollapse = null;
+      pendingSkill = null;
+      updateStatus(ctx);
+
+      await executeLoopIteration(ctx);
+      return;
     }
 
     await restoreModelAndThinking(ctx);
@@ -1047,15 +1506,37 @@ export default function (pi: ExtensionAPI) {
       switchedToThinking: pendingCollapse.switchedToThinking,
       injectedSkill: pendingCollapse.injectedSkill,
     };
-    const summary = generateSummaryFromEntries(entries, pendingCollapse.task, config);
+
+    // Generate summary, passing loop info if active
+    const loopInfo = loopState
+      ? {
+          iteration: loopState.currentIteration,
+          totalIterations: loopState.loopCount,
+        }
+      : undefined;
+    const summary = generateSummaryFromEntries(entries, pendingCollapse.task, config, loopInfo);
 
     // Save for anchor accumulation (used in agent_end after successful collapse)
     lastTaskSummary = summary;
 
-    const isCollapsingToAnchor = anchorEntryId !== null && pendingCollapse.targetId === anchorEntryId;
-    const finalSummary = isCollapsingToAnchor
-      ? [...anchorSummaries, summary].join("\n\n---\n\n")
-      : summary;
+    // Set convergence signal: record whether this iteration made changes
+    if (loopState) {
+      loopState.lastIterationHadChanges = didIterationMakeChanges(entries);
+    }
+
+    // Loop/anchor precedence: check loop first, then user-anchor, then raw
+    const isLoopCollapse = loopState !== null && pendingCollapse.targetId === loopState.autoAnchorId;
+    const isAnchorCollapse =
+      !isLoopCollapse && anchorEntryId !== null && pendingCollapse.targetId === anchorEntryId;
+
+    let finalSummary: string;
+    if (isLoopCollapse) {
+      finalSummary = [...loopState.iterationSummaries, summary].join("\n\n---\n\n");
+    } else if (isAnchorCollapse) {
+      finalSummary = [...anchorSummaries, summary].join("\n\n---\n\n");
+    } else {
+      finalSummary = summary;
+    }
 
     return {
       summary: {

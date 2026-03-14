@@ -1,0 +1,19 @@
+{
+  "id": "task-2",
+  "title": "Add LoopState interface, state variable, and update cleanup/status functions",
+  "status": "done",
+  "depends_on": [],
+  "created_at": "2026-03-14T21:26:14.328Z",
+  "updated_at": "2026-03-14T21:30:52.535Z",
+  "attempt_count": 1,
+  "started_at": "2026-03-14T21:29:15.553Z",
+  "base_commit": "dc5bdcd516ccc5a7fafa7e235c5d147f294b1431",
+  "completed_at": "2026-03-14T21:30:52.535Z",
+  "summary": "Added LoopState interface and state management to boomerang extension. Implemented: LoopState interface with iteration tracking, convergenceEnabled, summaries, and command context. Added loopState variable initialized to null. Updated clearState() to clear loopState on session start/switch. Updated boomerang-cancel handler to explicitly clear loopState after task cleanup. Enhanced updateStatus() to display loop progress (e.g., 'loop 2/5') and combined loop+chain progress. Added 6 tests covering loopState cleanup and status display. All 99 tests passing.",
+  "evidence": {
+    "commits": [],
+    "tests": [
+      "npm test passes 99/99 tests"
+    ]
+  }
+}

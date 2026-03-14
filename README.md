@@ -71,6 +71,22 @@ Each template's frontmatter controls model, skill, and thinking level for that s
 
 Status indicator shows progress as `chain 1/3`, `chain 2/3`, etc.
 
+## Loop Execution
+
+Run a task multiple times with changes accumulating across iterations:
+
+```bash
+/boomerang /deslop 5x
+/boomerang /scout -> /impl 3x -- "auth module"
+/boomerang "improve code quality" 10x --converge
+```
+
+Each iteration collapses back to the same anchor point. The agent sees all previous iteration summaries, so it builds on earlier work rather than starting from scratch.
+
+Add `--converge` to stop early when an iteration makes no file changes — useful for iterative improvement tasks that naturally converge.
+
+Status shows `loop 2/5` during execution. Cancel mid-loop with `/boomerang-cancel`.
+
 ## Prompt Templates
 
 If the task starts with `/`, boomerang treats it as a template reference:
@@ -137,8 +153,11 @@ One quirk: tool-initiated collapse may not update the UI immediately (the contex
 | Command | What it does |
 |---------|--------------|
 | `/boomerang <task>` | Execute and collapse |
+| `/boomerang <task> Nx` | Run task N times with accumulating changes |
+| `/boomerang <task> Nx --converge` | Run up to N times, stop if no changes |
 | `/boomerang /<template> [args]` | Run template and collapse |
 | `/boomerang /a -> /b -> /c` | Chain templates |
+| `/boomerang /a -> /b 3x` | Chain templates, loop 3 times |
 | `/boomerang-cancel` | Abort without collapsing |
 | `/boomerang anchor` | Set collapse point |
 | `/boomerang anchor show` | Show anchor info |

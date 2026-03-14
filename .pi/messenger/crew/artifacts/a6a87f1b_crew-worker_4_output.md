@@ -1,0 +1,1 @@
+Let me check the per-iteration reset logic:

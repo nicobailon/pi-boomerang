@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-14
+
+### Added
+
+- **Loop execution** — Run tasks multiple times with `/boomerang /task 5x`. Each iteration collapses back to an auto-managed anchor point, with changes accumulating across iterations. Supports templates, chains, and plain tasks.
+- **Convergence detection** — `--converge` flag stops the loop early if an iteration makes no file changes (e.g., `/boomerang /deslop 5x --converge`)
+- **Loop-aware system prompt** — Agent is told which iteration it's on so it builds on previous work incrementally
+- **Combined status indicators** — Shows `loop 2/5` during loops and `loop 2/5 · chain 1/3` for chain+loop combinations
+
 ## [0.2.1] - 2026-03-09
 
 ### Fixed

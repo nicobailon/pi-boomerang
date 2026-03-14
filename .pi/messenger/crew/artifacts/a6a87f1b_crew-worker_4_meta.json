@@ -1,0 +1,10 @@
+{
+  "runId": "a6a87f1b",
+  "agent": "crew-worker",
+  "index": 4,
+  "exitCode": 0,
+  "durationMs": 106282,
+  "tokens": 10361,
+  "truncated": false,
+  "error": "Expected ',' or '}' after property value in JSON at position 81 (line 1 column 82)"
+}

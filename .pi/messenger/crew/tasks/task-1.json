@@ -1,0 +1,12 @@
+{
+  "id": "task-1",
+  "title": "Implement extractLoopCount parser and didIterationMakeChanges",
+  "status": "in_progress",
+  "depends_on": [],
+  "created_at": "2026-03-14T21:25:53.524Z",
+  "updated_at": "2026-03-14T21:32:46.675Z",
+  "attempt_count": 2,
+  "started_at": "2026-03-14T21:32:46.668Z",
+  "base_commit": "dc5bdcd516ccc5a7fafa7e235c5d147f294b1431",
+  "assigned_to": "KeenStorm"
+}
