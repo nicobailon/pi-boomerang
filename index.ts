@@ -42,8 +42,8 @@ function saveConfig(config: BoomerangConfig): void {
     const { dir, path } = getConfigPath();
     mkdirSync(dir, { recursive: true });
     writeFileSync(path, JSON.stringify(config, null, 2));
-  } catch {
-    // Ignore write errors silently
+  } catch (err) {
+    console.warn(`[boomerang] Failed to save config: ${err}`);
   }
 }
 
@@ -375,15 +375,26 @@ export default function (pi: ExtensionAPI) {
     const restoredParts: string[] = [];
 
     if (previousModel) {
-      await pi.setModel(previousModel);
-      restoredParts.push(previousModel.id);
-      previousModel = undefined;
+      try {
+        await pi.setModel(previousModel);
+        restoredParts.push(previousModel.id);
+      } catch (err) {
+        console.warn(`[boomerang] Failed to restore model ${previousModel.id}: ${err}`);
+        ctx.ui.notify(`Failed to restore model ${previousModel.id}`, "error");
+      } finally {
+        previousModel = undefined;
+      }
     }
 
     if (previousThinking !== undefined) {
-      pi.setThinkingLevel(previousThinking);
-      restoredParts.push(`thinking:${previousThinking}`);
-      previousThinking = undefined;
+      try {
+        pi.setThinkingLevel(previousThinking);
+        restoredParts.push(`thinking:${previousThinking}`);
+      } catch (err) {
+        console.warn(`[boomerang] Failed to restore thinking level: ${err}`);
+      } finally {
+        previousThinking = undefined;
+      }
     }
 
     if (restoredParts.length > 0) {
@@ -1072,7 +1083,7 @@ export default function (pi: ExtensionAPI) {
         justCollapsedEntryId = null;
         return { cancel: true };
       }
-      justCollapsedEntryId = null;
+      // Keep guard active — wait for the correct compact event
     }
   });
 
