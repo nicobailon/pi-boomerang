@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-03
+
+### Fixed
+
+- Boomerang branch summaries now keep the full `Outcome` text instead of truncating at 500 characters, so collapsed context preserves complete results for future turns.
+- Preserved assistant formatting in `Outcome` summaries by normalizing line endings without flattening multiline content.
+
 ## [0.4.1] - 2026-04-03
 
 ### Changed

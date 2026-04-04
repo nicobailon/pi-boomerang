@@ -977,15 +977,14 @@ describe("Boomerang Extension", () => {
       expect(capturedSummary.summary.summary).toContain("Fixed the authentication bug");
     });
 
-    it("truncates long agent responses in the summary", async () => {
+    it("keeps full long agent responses in the summary", async () => {
       const longText = "A".repeat(600);
       await runBoomerang("do something");
       addAssistantTextEntry(longText);
       await triggerAgentEnd();
 
       expect(capturedSummary.summary.summary).toContain("Outcome:");
-      expect(capturedSummary.summary.summary).toContain("...");
-      expect(capturedSummary.summary.summary.length).toBeLessThan(650);
+      expect(capturedSummary.summary.summary).toContain(longText);
     });
 
     it("includes Config line when template switched model, thinking, or skill", async () => {

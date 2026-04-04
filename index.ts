@@ -1291,10 +1291,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (lastAssistantText) {
-      const cleaned = lastAssistantText.replace(/\n+/g, " ").trim();
-      const truncated = cleaned.slice(0, 500);
-      const ellipsis = cleaned.length > 500 ? "..." : "";
-      summary += `\nOutcome: ${truncated}${ellipsis}`;
+      const cleaned = lastAssistantText.replace(/\r\n?/g, "\n").trim();
+      summary += `\nOutcome: ${cleaned}`;
     } else if (actionParts.length === 0 && configParts.length === 0) {
       summary += `\nResult: No output recorded.`;
     }
