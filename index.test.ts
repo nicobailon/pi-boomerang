@@ -1,7 +1,14 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, SessionEntry } from "@mariozechner/pi-coding-agent";
+import { DEFAULT_COMPACTION_SETTINGS } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionCommandContext,
+  SessionBeforeCompactEvent,
+  SessionEntry,
+} from "@mariozechner/pi-coding-agent";
 
 const mockState = vi.hoisted(() => ({
   homeDir: "",
@@ -169,10 +176,11 @@ describe("Boomerang Extension", () => {
   let commands: Map<string, { description: string; handler: Function }>;
   let tools: Map<string, { name: string; execute: Function }>;
   let sentMessages: string[];
+  let sentCustomMessages: Array<{ message: { customType: string; content: string; display: boolean }; options: { triggerTurn?: boolean; deliverAs?: string } | undefined }>;
   let sessionEntries: SessionEntry[];
   let navigateTreeCalls: { targetId: string; options: { summarize?: boolean } }[];
-  let branchWithSummaryCalls: { targetId: string; summary: string; entryId: string }[];
-  let capturedSummary: { summary: { summary: string; details: { task: string } } } | undefined;
+  let branchWithSummaryCalls: { targetId: string; summary: string; entryId: string; details?: unknown }[];
+  let capturedSummary: { summary: { summary: string; details: { task: string; readFiles: string[]; modifiedFiles: string[]; validationCommands: string[]; failedOperations: string[]; commandCount: number } } } | undefined;
   let setModelCalls: string[];
   let setThinkingCalls: string[];
 
@@ -266,12 +274,34 @@ describe("Boomerang Extension", () => {
     return id;
   }
 
-  function addAssistantToolEntry(toolName: string, path?: string) {
-    return addSessionEntry({
+  function addAssistantToolEntry(toolName: string, args?: string | Record<string, unknown>) {
+    const toolCallId = `tool-${sessionEntries.length}`;
+    addSessionEntry({
       type: "message",
       message: {
         role: "assistant",
-        content: [{ type: "toolCall", name: toolName, arguments: path ? { path } : {} }],
+        content: [{
+          type: "toolCall",
+          id: toolCallId,
+          name: toolName,
+          arguments: typeof args === "string" ? { path: args } : args ?? {},
+        }],
+      },
+      timestamp: new Date().toISOString(),
+    });
+    return toolCallId;
+  }
+
+  function addToolResultEntry(toolName: string, isError: boolean, text: string, toolCallId = `tool-${sessionEntries.length}`) {
+    return addSessionEntry({
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId,
+        toolName,
+        content: [{ type: "text", text }],
+        isError,
+        timestamp: Date.now(),
       },
       timestamp: new Date().toISOString(),
     });
@@ -356,6 +386,18 @@ describe("Boomerang Extension", () => {
     return uiMock.notify.mock.calls.map(([message, level]: [string, string]) => ({ message, level }));
   }
 
+  function expectBoomerangHandoff(count = 1) {
+    expect(sentCustomMessages).toHaveLength(count);
+    expect(sentCustomMessages[count - 1]).toEqual({
+      message: {
+        customType: "boomerang-handoff",
+        content: "A boomerang task completed. Read the latest [BOOMERANG COMPLETE] summary and continue from it.",
+        display: false,
+      },
+      options: { triggerTurn: true, deliverAs: "followUp" },
+    });
+  }
+
   beforeEach(() => {
     tempRoot = mkdtempSync(join(process.cwd(), ".tmp-boomerang-"));
     homeDir = join(tempRoot, "home");
@@ -369,6 +411,7 @@ describe("Boomerang Extension", () => {
     commands = new Map();
     tools = new Map();
     sentMessages = [];
+    sentCustomMessages = [];
     sessionEntries = [];
     navigateTreeCalls = [];
     branchWithSummaryCalls = [];
@@ -426,10 +469,10 @@ describe("Boomerang Extension", () => {
       sessionManager: {
         getBranch: () => sessionEntries,
         getLeafId: () => currentLeafId,
-        branchWithSummary: vi.fn((targetId: string, summary: string) => {
+        branchWithSummary: vi.fn((targetId: string, summary: string, details?: unknown) => {
           const entryId = `branch-summary-${branchWithSummaryCalls.length}`;
-          branchWithSummaryCalls.push({ targetId, summary, entryId });
-          sessionEntries.push({ id: entryId, type: "branch_summary", summary });
+          branchWithSummaryCalls.push({ targetId, summary, entryId, details });
+          sessionEntries.push({ id: entryId, type: "branch_summary", summary, details });
           currentLeafId = entryId;
           return entryId;
         }),
@@ -452,6 +495,16 @@ describe("Boomerang Extension", () => {
           type: "message",
           message: { role: "user", content, timestamp: Date.now() },
           timestamp: new Date().toISOString(),
+        });
+      }),
+      sendMessage: vi.fn((message: { customType: string; content: string; display: boolean; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: string }) => {
+        sentCustomMessages.push({ message, options });
+        addSessionEntry({
+          type: "custom_message",
+          customType: message.customType,
+          content: message.content,
+          display: message.display,
+          details: message.details,
         });
       }),
       setModel: vi.fn(async (nextModel: { provider: string; id: string }) => {
@@ -605,7 +658,7 @@ describe("Boomerang Extension", () => {
       expect(sentMessages).toEqual(["Step 1", "Step 2"]);
     });
 
-    it("collapses only after the last chain step", async () => {
+    it("summarizes only after the last chain step", async () => {
       writePrompt("user", "step1", "Step 1");
       writePrompt("user", "step2", "Step 2");
 
@@ -728,7 +781,7 @@ describe("Boomerang Extension", () => {
       expect(currentModel).toEqual(model("anthropic", "claude-opus-4-6"));
     });
 
-    it("restores the previous model after collapse", async () => {
+    it("restores the previous model after summarizing", async () => {
       writePrompt("user", "commit", "---\nmodel: claude-opus-4-6\n---\nCommit $@");
 
       await runBoomerang("/commit fix auth");
@@ -852,7 +905,7 @@ describe("Boomerang Extension", () => {
       expect(currentThinking).toBe("xhigh");
     });
 
-    it("restores the previous thinking level after collapse", async () => {
+    it("restores the previous thinking level after summarizing", async () => {
       writePrompt("user", "deep-dive", "---\nthinking: xhigh\n---\nInspect $@");
 
       await runBoomerang("/deep-dive auth");
@@ -967,16 +1020,23 @@ describe("Boomerang Extension", () => {
       expect(capturedSummary.summary.summary).toContain("I completed the task successfully");
     });
 
-    it("includes both Actions and Outcome when tools are used and text is returned", async () => {
+    it("includes operational handoff sections when tools are used and text is returned", async () => {
       await runBoomerang("fix auth");
+      addAssistantToolEntry("read", "src/auth.ts");
       addAssistantToolEntry("edit", "src/auth.ts");
+      addAssistantToolEntry("bash", { command: "npm test" });
       addAssistantTextEntry("Fixed the authentication bug by updating the JWT validation.");
       await triggerAgentEnd();
 
-      expect(capturedSummary.summary.summary).toContain("Actions:");
-      expect(capturedSummary.summary.summary).toContain("modified src/auth.ts");
-      expect(capturedSummary.summary.summary).toContain("Outcome:");
-      expect(capturedSummary.summary.summary).toContain("Fixed the authentication bug");
+      const summary = capturedSummary.summary.summary;
+      expect(summary).toContain("Outcome:\nFixed the authentication bug");
+      expect(summary).toContain("Changed Files:\n- src/auth.ts");
+      expect(summary).not.toContain("Relevant Reads:\n- src/auth.ts");
+      expect(summary).toContain("Commands:\n- Ran 1 command(s)");
+      expect(summary).toContain("- Validation: `npm test`");
+      expect(summary).toContain("- Failures: none detected");
+      expect(capturedSummary.summary.details.modifiedFiles).toEqual(["src/auth.ts"]);
+      expect(capturedSummary.summary.details.validationCommands).toEqual(["npm test"]);
     });
 
     it("keeps full long agent responses in the summary", async () => {
@@ -989,7 +1049,7 @@ describe("Boomerang Extension", () => {
       expect(capturedSummary.summary.summary).toContain(longText);
     });
 
-    it("includes Config line when template switched model, thinking, or skill", async () => {
+    it("includes Config block when template switched model, thinking, or skill", async () => {
       writePrompt("user", "full-config", "---\nmodel: claude-opus-4-6\nskill: git-workflow\nthinking: high\n---\nDo the task");
       writeSkill("user", "git-workflow", "Git skill content");
 
@@ -997,10 +1057,9 @@ describe("Boomerang Extension", () => {
       addAssistantTextEntry("Task completed.");
       await triggerAgentEnd();
 
-      expect(capturedSummary.summary.summary).toContain("Config:");
-      expect(capturedSummary.summary.summary).toContain("model: claude-opus-4-6");
-      expect(capturedSummary.summary.summary).toContain("thinking: high");
-      expect(capturedSummary.summary.summary).toContain("skill: git-workflow");
+      expect(capturedSummary.summary.summary).toContain("Config:\n- model: claude-opus-4-6");
+      expect(capturedSummary.summary.summary).toContain("- thinking: high");
+      expect(capturedSummary.summary.summary).toContain("- skill: git-workflow");
     });
 
     it("preserves raw quoted template args in rethrow summaries", async () => {
@@ -1020,6 +1079,24 @@ describe("Boomerang Extension", () => {
       expect(capturedSummary.summary.summary).toContain("[BOOMERANG COMPLETE]");
       expect(capturedSummary.summary.summary).not.toContain("RETHROW");
     });
+
+    it("includes relevant read-only files and failed operations", async () => {
+      await runBoomerang("investigate auth");
+      addAssistantToolEntry("read", "src/auth.ts");
+      addAssistantToolEntry("read", "src/session.ts");
+      const bashToolCallId = addAssistantToolEntry("bash", { command: "git diff --check" });
+      addToolResultEntry("bash", true, "trailing whitespace in src/auth.ts", bashToolCallId);
+      addAssistantTextEntry("Found formatting issue but did not edit files.");
+      await triggerAgentEnd();
+
+      const summary = capturedSummary.summary.summary;
+      expect(summary).toContain("Changed Files:\n- None");
+      expect(summary).toContain("Relevant Reads:\n- src/auth.ts\n- src/session.ts");
+      expect(summary).toContain("- Validation: `git diff --check`");
+      expect(summary).toContain("- Failures: bash `git diff --check`: trailing whitespace in src/auth.ts");
+      expect(capturedSummary.summary.details.readFiles).toEqual(["src/auth.ts", "src/session.ts"]);
+      expect(capturedSummary.summary.details.failedOperations).toEqual(["bash `git diff --check`: trailing whitespace in src/auth.ts"]);
+    });
   });
 
   describe("rethrow command handler", () => {
@@ -1032,6 +1109,7 @@ describe("Boomerang Extension", () => {
       expect(navigateTreeCalls).toHaveLength(2);
       expect(uiMock.notify).toHaveBeenCalledWith("Rethrow started: 2 iterations", "info");
       expect(uiMock.notify).toHaveBeenCalledWith("Rethrow complete: 2/2", "info");
+      expectBoomerangHandoff();
     });
 
     it("treats --loop N as a rethrow alias for boomerang templates", async () => {
@@ -1176,7 +1254,7 @@ describe("Boomerang Extension", () => {
   });
 
   describe("rethrow accumulation and cleanup", () => {
-    it("user-anchor collapse still works when no rethrow is active", async () => {
+    it("user-anchor summary still works when no rethrow is active", async () => {
       writePrompt("user", "task1", "Task 1");
       const anchorId = currentLeafId;
 
@@ -1227,7 +1305,7 @@ describe("Boomerang Extension", () => {
       expect(uiMock.notify).toHaveBeenCalledWith("Boomerang cancelled", "info");
     });
 
-    it("accumulates rethrow summaries into a combined collapse summary", async () => {
+    it("accumulates rethrow summaries into a combined summary", async () => {
       writePrompt("user", "task", "Task");
       let callCount = 0;
       waitForIdleMock.mockImplementation(async () => {
@@ -1262,7 +1340,7 @@ describe("Boomerang Extension", () => {
       expect(capturedSummary?.summary.summary).not.toContain("[BOOMERANG COMPLETE - RETHROW 1/1]");
     });
 
-    it("stops rethrows when collapse is cancelled", async () => {
+    it("stops rethrows when summarization is cancelled", async () => {
       writePrompt("user", "task", "Task");
       const cancellingCtx = createCommandCtx({
         navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
@@ -1275,8 +1353,9 @@ describe("Boomerang Extension", () => {
 
       expect(sentMessages).toHaveLength(1);
       expect(navigateTreeCalls).toHaveLength(1);
-      expect(uiMock.notify).toHaveBeenCalledWith("Collapse cancelled", "warning");
+      expect(uiMock.notify).toHaveBeenCalledWith("Summary cancelled", "warning");
       expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+      expect(sentCustomMessages).toEqual([]);
     });
   });
 
@@ -1294,9 +1373,9 @@ describe("Boomerang Extension", () => {
 
       expect(sentMessages).toHaveLength(3);
       expect(navigateTreeCalls).toHaveLength(3);
-      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow 1/3 collapsed", "info");
-      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow 2/3 collapsed", "info");
-      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow 3/3 collapsed", "info");
+      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow 1/3 summarized", "info");
+      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow 2/3 summarized", "info");
+      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow 3/3 summarized", "info");
       expect(uiMock.notify).toHaveBeenCalledWith("Rethrow complete: 3/3", "info");
     });
 
@@ -1322,29 +1401,6 @@ describe("Boomerang Extension", () => {
 
       expect(sentMessages).toHaveLength(2);
       expect(navigateTreeCalls).toHaveLength(1);
-    });
-
-    it("does not expand details when cancelled during rethrow collapse", async () => {
-      writePrompt("user", "task", "Task");
-      let finishCollapse: (() => void) | null = null;
-      const collapsingCtx = createCommandCtx({
-        navigateTree: vi.fn((targetId: string, options: { summarize?: boolean }) => {
-          navigateTreeCalls.push({ targetId, options });
-          return new Promise<{ cancelled: boolean }>((resolve) => {
-            finishCollapse = () => resolve({ cancelled: false });
-          });
-        }),
-      });
-
-      const running = runBoomerang("/task --rethrow 2", collapsingCtx);
-      while (!finishCollapse) {
-        await Promise.resolve();
-      }
-      await runCancel(collapsingCtx);
-      finishCollapse();
-      await running;
-
-      expect(uiMock.setToolsExpanded).not.toHaveBeenCalled();
     });
 
     it("stops when cancelled before a rethrow turn starts", async () => {
@@ -1468,7 +1524,7 @@ describe("Boomerang Extension", () => {
   });
 
   describe("integration behavior", () => {
-    it("does not collapse before the assistant responds", async () => {
+    it("does not summarize before the assistant responds", async () => {
       writePrompt("user", "task", "---\nmodel: claude-opus-4-6\n---\nTask content");
 
       await runBoomerang("/task");
@@ -1540,15 +1596,95 @@ describe("Boomerang Extension", () => {
       expect(currentModel).toEqual(model("anthropic", "claude-opus-4-6"));
     });
 
-    it("expands boomerang summary details after collapse", async () => {
+    it("keeps boomerang details expanded from task start", async () => {
       await runBoomerang("fix auth");
-      addAssistantTextEntry("Done.");
-      await triggerAgentEnd();
 
       expect(uiMock.setToolsExpanded).toHaveBeenCalledWith(true);
     });
 
-    it("sets the global collapse flag during template collapse", async () => {
+    it("expands before summary navigation creates summary rows", async () => {
+      let expandedBeforeNavigation = false;
+      const trackingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          expandedBeforeNavigation = uiMock.setToolsExpanded.mock.calls.some(([expanded]) => expanded === true);
+          navigateTreeCalls.push({ targetId, options });
+          return { cancelled: false };
+        }),
+      });
+
+      await runBoomerang("fix auth", trackingCtx);
+      uiMock.setToolsExpanded.mockClear();
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(expandedBeforeNavigation).toBe(true);
+    });
+
+    it("expands before compaction rows are created while boomerang is active", async () => {
+      await runBoomerang("fix auth");
+      uiMock.setToolsExpanded.mockClear();
+
+      const event: SessionBeforeCompactEvent = {
+        type: "session_before_compact",
+        branchEntries: sessionEntries,
+        preparation: {
+          firstKeptEntryId: currentLeafId ?? "entry-0",
+          messagesToSummarize: [],
+          turnPrefixMessages: [],
+          isSplitTurn: false,
+          tokensBefore: 0,
+          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+          settings: DEFAULT_COMPACTION_SETTINGS,
+        },
+        signal: new AbortController().signal,
+      };
+
+      await getHandler("session_before_compact")(event, mockCtx);
+
+      expect(uiMock.setToolsExpanded).toHaveBeenCalledWith(true);
+    });
+
+    it("wakes the orchestrator with a hidden handoff after successful return", async () => {
+      await runBoomerang("fix auth");
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expectBoomerangHandoff();
+    });
+
+    it("does not wake the orchestrator when normal summarization is cancelled", async () => {
+      const cancellingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          return { cancelled: true };
+        }),
+      });
+
+      await runBoomerang("fix auth", cancellingCtx);
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Summary cancelled", "warning");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("does not wake the orchestrator when normal summarization throws", async () => {
+      const throwingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          throw new Error("navigation failed");
+        }),
+      });
+
+      await runBoomerang("fix auth", throwingCtx);
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Failed to summarize: Error: navigation failed", "error");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("sets the global summarize flag during template summarization", async () => {
       writePrompt("user", "commit", "Commit $@");
       let flagDuringNavigation: boolean | undefined;
       const trackingCtx = createCommandCtx({
@@ -1579,7 +1715,7 @@ describe("Boomerang Extension", () => {
       expect(uiMock.notify).toHaveBeenCalledWith("Restored to current-model, thinking:low", "info");
     });
 
-    it("keeps tool-initiated collapse flow working", async () => {
+    it("keeps tool-initiated summary flow working", async () => {
       await runBoomerang("tool on");
 
       const tool = getTool("boomerang");
@@ -1590,6 +1726,125 @@ describe("Boomerang Extension", () => {
 
       expect(navigateTreeCalls).toHaveLength(1);
       expect(navigateTreeCalls[0].options).toEqual({ summarize: true });
+      expectBoomerangHandoff();
+    });
+
+    it("does not wake the orchestrator when stored-context tool summarization is cancelled", async () => {
+      const cancellingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          return { cancelled: true };
+        }),
+      });
+      await runBoomerang("tool on", cancellingCtx);
+
+      const tool = getTool("boomerang");
+      await tool.execute("id-1", {}, undefined, undefined, mockCtx);
+      addAssistantTextEntry("tool work");
+      await tool.execute("id-2", {}, undefined, undefined, mockCtx);
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Summary cancelled", "warning");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("does not wake the orchestrator when stored-context tool summarization throws", async () => {
+      const throwingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          throw new Error("tool navigation failed");
+        }),
+      });
+      await runBoomerang("tool on", throwingCtx);
+
+      const tool = getTool("boomerang");
+      await tool.execute("id-1", {}, undefined, undefined, mockCtx);
+      addAssistantTextEntry("tool work");
+      await tool.execute("id-2", {}, undefined, undefined, mockCtx);
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Failed to summarize: Error: tool navigation failed", "error");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("cancels compaction after fallback summary followed by hidden handoff", async () => {
+      await runBoomerang("tool on");
+      await fireSessionSwitch();
+
+      const tool = getTool("boomerang");
+      await tool.execute("id-1", {}, undefined, undefined, mockCtx);
+      addAssistantTextEntry("tool work");
+      await tool.execute("id-2", {}, undefined, undefined, mockCtx);
+      await triggerAgentEnd();
+
+      expect(branchWithSummaryCalls).toHaveLength(1);
+      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe(branchWithSummaryCalls[0].entryId);
+      expect(sessionEntries[sessionEntries.length - 1]?.type).toBe("custom_message");
+
+      const event: SessionBeforeCompactEvent = {
+        type: "session_before_compact",
+        branchEntries: sessionEntries,
+        preparation: {
+          firstKeptEntryId: currentLeafId ?? "entry-0",
+          messagesToSummarize: [],
+          turnPrefixMessages: [],
+          isSplitTurn: false,
+          tokensBefore: 0,
+          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+          settings: DEFAULT_COMPACTION_SETTINGS,
+        },
+        signal: new AbortController().signal,
+      };
+
+      await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toEqual({ cancel: true });
+    });
+
+    it("does not cancel compaction after unrelated entries follow the fallback handoff", async () => {
+      await runBoomerang("tool on");
+      await fireSessionSwitch();
+
+      const tool = getTool("boomerang");
+      await tool.execute("id-1", {}, undefined, undefined, mockCtx);
+      addAssistantTextEntry("tool work");
+      await tool.execute("id-2", {}, undefined, undefined, mockCtx);
+      await triggerAgentEnd();
+      addAssistantTextEntry("later work");
+
+      const event: SessionBeforeCompactEvent = {
+        type: "session_before_compact",
+        branchEntries: sessionEntries,
+        preparation: {
+          firstKeptEntryId: currentLeafId ?? "entry-0",
+          messagesToSummarize: [],
+          turnPrefixMessages: [],
+          isSplitTurn: false,
+          tokensBefore: 0,
+          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+          settings: DEFAULT_COMPACTION_SETTINGS,
+        },
+        signal: new AbortController().signal,
+      };
+
+      await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toBeUndefined();
+    });
+
+    it("does not wake the orchestrator when fallback branch summary creation throws", async () => {
+      await runBoomerang("tool on");
+      await fireSessionSwitch();
+
+      const branchWithSummary = (mockCtx.sessionManager as any).branchWithSummary as ReturnType<typeof vi.fn>;
+      branchWithSummary.mockImplementationOnce(() => {
+        throw new Error("branch summary failed");
+      });
+
+      const tool = getTool("boomerang");
+      await tool.execute("id-1", {}, undefined, undefined, mockCtx);
+      addAssistantTextEntry("tool work");
+      await tool.execute("id-2", {}, undefined, undefined, mockCtx);
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Failed to summarize: Error: branch summary failed", "error");
+      expect(sentCustomMessages).toEqual([]);
     });
 
     it("agent can queue a plain task via the tool", async () => {

@@ -1,8 +1,8 @@
 /**
  * pi-boomerang - Token-efficient autonomous task execution
  *
- * Executes a task autonomously, then collapses the entire exchange into
- * a brief summary using navigateTree (like /tree does).
+ * Executes a task autonomously, then summarizes the exchange using
+ * navigateTree (like /tree does).
  *
  * Usage: /boomerang <task>
  */
@@ -47,6 +47,7 @@ function loadConfig(): BoomerangConfig {
     };
   } catch (error) {
     console.error(`[boomerang] Failed to load config from ${path}: ${String(error)}`);
+    // Extension initialization has no UI context; load with defaults after logging the exact config error.
     return {};
   }
 }
@@ -377,7 +378,7 @@ const BOOMERANG_INSTRUCTIONS = `BOOMERANG MODE ACTIVE
 
 You are in boomerang mode - a token-efficient execution mode where:
 1. You complete the task fully and autonomously (no clarifying questions)
-2. When done, this entire exchange is collapsed into a brief summary
+2. When done, this entire exchange is summarized into a brief handoff
 3. Future context will only show what was accomplished, not the step-by-step details
 
 Make reasonable assumptions. Work thoroughly - there is no back-and-forth.
@@ -922,6 +923,7 @@ export default function (pi: ExtensionAPI) {
     };
 
     boomerangActive = true;
+    keepBoomerangExpanded(ctx);
     updateStatus(ctx);
 
     ctx.ui.notify(`Chain started: ${stepNames}`, "info");
@@ -1176,9 +1178,10 @@ export default function (pi: ExtensionAPI) {
         let collapseResult: { cancelled: boolean } | undefined;
         try {
           globalThis.__boomerangCollapseInProgress = true;
+          keepBoomerangExpanded(ctx);
           collapseResult = await commandCtx.navigateTree(currentRethrow.autoAnchorId, { summarize: true });
         } catch (err) {
-          ctx.ui.notify(`Failed to collapse: ${String(err)}`, "error");
+          ctx.ui.notify(`Failed to summarize: ${String(err)}`, "error");
           break;
         } finally {
           globalThis.__boomerangCollapseInProgress = false;
@@ -1186,20 +1189,17 @@ export default function (pi: ExtensionAPI) {
         pendingCollapse = null;
 
         if (!collapseResult || collapseResult.cancelled) {
-          ctx.ui.notify("Collapse cancelled", "warning");
+          ctx.ui.notify("Summary cancelled", "warning");
           break;
         }
         if (!boomerangActive || !rethrowState) break;
-        if (ctx.hasUI) {
-          ctx.ui.setToolsExpanded(true);
-        }
 
         if (lastTaskSummary) {
           rethrowState.rethrowSummaries.push(lastTaskSummary);
         }
         lastTaskSummary = null;
 
-        ctx.ui.notify(`Rethrow ${i}/${totalRethrows} collapsed`, "info");
+        ctx.ui.notify(`Rethrow ${i}/${totalRethrows} summarized`, "info");
         completedRethrows = i;
         updateStatus(ctx);
       }
@@ -1211,8 +1211,26 @@ export default function (pi: ExtensionAPI) {
       updateStatus(ctx);
       if (completedNormally) {
         ctx.ui.notify(`Rethrow complete: ${totalRethrows}/${totalRethrows}`, "info");
+        triggerOrchestratorHandoff();
       }
     }
+  }
+
+  function keepBoomerangExpanded(ctx: Pick<ExtensionContext, "hasUI" | "ui">) {
+    if (ctx.hasUI) {
+      ctx.ui.setToolsExpanded(true);
+    }
+  }
+
+  function triggerOrchestratorHandoff() {
+    pi.sendMessage({
+      customType: "boomerang-handoff",
+      content: "A boomerang task completed. Read the latest [BOOMERANG COMPLETE] summary and continue from it.",
+      display: false,
+    }, {
+      triggerTurn: true,
+      deliverAs: "followUp",
+    });
   }
 
   function updateStatus(ctx: ExtensionContext) {
@@ -1240,67 +1258,164 @@ export default function (pi: ExtensionAPI) {
     injectedSkill?: string;
   }
 
-  function generateSummaryFromEntries(
-    entries: SessionEntry[],
-    task: string,
-    config?: SummaryConfig,
-    rethrowInfo?: { rethrow: number; totalRethrows: number }
-  ): string {
+  interface BoomerangSummaryDetails {
+    task: string;
+    readFiles: string[];
+    modifiedFiles: string[];
+    validationCommands: string[];
+    failedOperations: string[];
+    commandCount: number;
+  }
+
+  interface BoomerangSummary {
+    summary: string;
+    details: BoomerangSummaryDetails;
+  }
+
+  const READ_FILE_LIMIT = 12;
+
+  function isValidationCommand(command: string): boolean {
+    return /(^|\s)(npm|pnpm|yarn|bun)\s+(run\s+)?(test|check|lint|typecheck|verify)\b/.test(command)
+      || /(^|\s)(vitest|jest|pytest|ruff|cargo\s+test|go\s+test|swift\s+test)\b/.test(command)
+      || /(^|\s)git\s+diff\s+--check\b/.test(command);
+  }
+
+  function formatCommand(command: string): string {
+    const singleLine = command.replace(/\s+/g, " ").trim();
+    return singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
+  }
+
+  function formatList(items: string[]): string {
+    return items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : "- None";
+  }
+
+  function collectBoomerangSummaryDetails(entries: SessionEntry[], task: string): BoomerangSummaryDetails & { outcome: string } {
     const filesRead = new Set<string>();
     const filesWritten = new Set<string>();
+    const validationCommands = new Set<string>();
+    const failedOperations: string[] = [];
+    const bashCommandsById = new Map<string, string>();
     let commandCount = 0;
     let lastAssistantText = "";
 
     for (const entry of entries) {
       if (entry.type !== "message") continue;
       const msg = entry.message;
-      if (msg.role !== "assistant") continue;
 
-      for (const block of (msg as AssistantMessage).content) {
-        if (block.type === "text") {
-          lastAssistantText = block.text;
+      if (msg.role === "assistant") {
+        for (const block of (msg as AssistantMessage).content) {
+          if (block.type === "text") {
+            lastAssistantText = block.text;
+          }
+          if (block.type !== "toolCall") continue;
+
+          if (block.name === "bash") {
+            commandCount++;
+            const command = (block.arguments as Record<string, unknown>).command;
+            if (typeof command === "string") {
+              const formattedCommand = formatCommand(command);
+              bashCommandsById.set(block.id, formattedCommand);
+              if (isValidationCommand(command)) {
+                validationCommands.add(formattedCommand);
+              }
+            }
+            continue;
+          }
+
+          const path = (block.arguments as Record<string, unknown>).path;
+          if (typeof path !== "string" || !path) continue;
+          const cleanPath = path.replace(/^@/, "");
+          if (block.name === "read") filesRead.add(cleanPath);
+          if (block.name === "write" || block.name === "edit") filesWritten.add(cleanPath);
         }
-        if (block.type !== "toolCall") continue;
-        if (block.name === "bash") {
-          commandCount++;
-          continue;
-        }
-        const path = (block.arguments as Record<string, unknown>).path as string | undefined;
-        if (block.name === "read" && path) filesRead.add(path);
-        if (block.name === "write" && path) filesWritten.add(path);
-        if (block.name === "edit" && path) filesWritten.add(path);
+        continue;
+      }
+
+      if (msg.role === "toolResult" && msg.isError) {
+        const text = Array.isArray(msg.content)
+          ? msg.content
+              .filter((block) => block.type === "text")
+              .map((block) => block.text.trim())
+              .filter(Boolean)
+              .join(" ")
+          : "";
+        const errorText = text.length > 160 ? `${text.slice(0, 157)}...` : text;
+        const failedCommand = bashCommandsById.get(msg.toolCallId);
+        const operation = failedCommand ? `${msg.toolName} \`${failedCommand}\`` : msg.toolName;
+        failedOperations.push(errorText ? `${operation}: ${errorText}` : operation);
       }
     }
 
+    const modifiedFiles = [...filesWritten].sort();
+    const readFiles = [...filesRead].filter((path) => !filesWritten.has(path)).sort();
+
+    return {
+      task,
+      readFiles,
+      modifiedFiles,
+      validationCommands: [...validationCommands].sort(),
+      failedOperations,
+      commandCount,
+      outcome: lastAssistantText.replace(/\r\n?/g, "\n").trim(),
+    };
+  }
+
+  function generateSummaryFromEntries(
+    entries: SessionEntry[],
+    task: string,
+    config?: SummaryConfig,
+    rethrowInfo?: { rethrow: number; totalRethrows: number }
+  ): BoomerangSummary {
+    const details = collectBoomerangSummaryDetails(entries, task);
     const headerLabel = rethrowInfo
       ? `[BOOMERANG COMPLETE - RETHROW ${rethrowInfo.rethrow}/${rethrowInfo.totalRethrows}]`
       : `[BOOMERANG COMPLETE]`;
-    let summary = `${headerLabel}\nTask: "${task}"`;
+
+    const sections = [
+      headerLabel,
+      `Task: "${task}"`,
+      `Outcome:\n${details.outcome || "No assistant outcome recorded."}`,
+      `Changed Files:\n${formatList(details.modifiedFiles)}`,
+    ];
+
+    const visibleReadFiles = details.readFiles.slice(0, READ_FILE_LIMIT);
+    if (visibleReadFiles.length > 0) {
+      const omittedCount = details.readFiles.length - visibleReadFiles.length;
+      sections.push(
+        `Relevant Reads:\n${formatList(visibleReadFiles)}${omittedCount > 0 ? `\n- ... ${omittedCount} more read-only file(s)` : ""}`
+      );
+    }
+
+    const commandLines = [`- Ran ${details.commandCount} command(s)`];
+    if (details.validationCommands.length > 0) {
+      commandLines.push(`- Validation: ${details.validationCommands.map((command) => `\`${command}\``).join(", ")}`);
+    }
+    commandLines.push(
+      details.failedOperations.length > 0
+        ? `- Failures: ${details.failedOperations.join("; ")}`
+        : "- Failures: none detected"
+    );
+    sections.push(`Commands:\n${commandLines.join("\n")}`);
 
     const configParts: string[] = [];
-    if (config?.switchedToModel) configParts.push(`model: ${config.switchedToModel}`);
-    if (config?.switchedToThinking) configParts.push(`thinking: ${config.switchedToThinking}`);
-    if (config?.injectedSkill) configParts.push(`skill: ${config.injectedSkill}`);
+    if (config?.switchedToModel) configParts.push(`- model: ${config.switchedToModel}`);
+    if (config?.switchedToThinking) configParts.push(`- thinking: ${config.switchedToThinking}`);
+    if (config?.injectedSkill) configParts.push(`- skill: ${config.injectedSkill}`);
     if (configParts.length > 0) {
-      summary += `\nConfig: ${configParts.join(", ")}`;
+      sections.push(`Config:\n${configParts.join("\n")}`);
     }
 
-    const actionParts: string[] = [];
-    if (filesRead.size > 0) actionParts.push(`read ${filesRead.size} file(s)`);
-    if (filesWritten.size > 0) actionParts.push(`modified ${[...filesWritten].join(", ")}`);
-    if (commandCount > 0) actionParts.push(`ran ${commandCount} command(s)`);
-    if (actionParts.length > 0) {
-      summary += `\nActions: ${actionParts.join(", ")}.`;
-    }
-
-    if (lastAssistantText) {
-      const cleaned = lastAssistantText.replace(/\r\n?/g, "\n").trim();
-      summary += `\nOutcome: ${cleaned}`;
-    } else if (actionParts.length === 0 && configParts.length === 0) {
-      summary += `\nResult: No output recorded.`;
-    }
-
-    return summary;
+    return {
+      summary: sections.join("\n\n"),
+      details: {
+        task: details.task,
+        readFiles: details.readFiles,
+        modifiedFiles: details.modifiedFiles,
+        validationCommands: details.validationCommands,
+        failedOperations: details.failedOperations,
+        commandCount: details.commandCount,
+      },
+    };
   }
 
   async function startTask(
@@ -1391,6 +1506,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       boomerangActive = true;
+      keepBoomerangExpanded(ctx);
       updateStatus(ctx);
       if (usedLoopAlias) {
         ctx.ui.notify(`Mapped --loop to boomerang --rethrow ${extracted.rethrowCount}.`, "info");
@@ -1484,6 +1600,7 @@ export default function (pi: ExtensionAPI) {
         : `/${templateRef}`;
 
       boomerangActive = true;
+      keepBoomerangExpanded(ctx);
 
       const targetId = anchorEntryId ?? startEntryId!;
       pendingCollapse = { targetId, task: taskDisplayName, commandCtx: ctx, switchedToModel, switchedToThinking, injectedSkill };
@@ -1498,6 +1615,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     boomerangActive = true;
+    keepBoomerangExpanded(ctx);
 
     const targetId = anchorEntryId ?? startEntryId!;
     pendingCollapse = { targetId, task: taskDisplayName, commandCtx: ctx };
@@ -1511,7 +1629,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("boomerang", {
-    description: "Execute task autonomously, then collapse context to summary",
+    description: "Execute task autonomously, then summarize context",
     handler: async (args, ctx) => {
       storedCommandCtx = ctx;
       const trimmed = args.trim();
@@ -1529,7 +1647,7 @@ export default function (pi: ExtensionAPI) {
         anchorEntryId = leafId;
         anchorSummaries = [];
         updateStatus(ctx);
-        ctx.ui.notify("Anchor set. Subsequent boomerangs will collapse to this point.", "info");
+        ctx.ui.notify("Anchor set. Subsequent boomerangs will summarize to this point.", "info");
         return;
       }
 
@@ -1625,7 +1743,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("boomerang-cancel", {
-    description: "Cancel active boomerang (no context collapse)",
+    description: "Cancel active boomerang (no context summary)",
     handler: async (_args, ctx) => {
       storedCommandCtx = ctx;
       const hasActive = boomerangActive || chainState || toolAnchorEntryId !== null || toolCollapsePending || toolQueuedTask !== null;
@@ -1652,13 +1770,13 @@ export default function (pi: ExtensionAPI) {
       name: "boomerang",
       label: "Boomerang",
       description:
-        "Execute a task autonomously in boomerang mode, then collapse context to a summary. " +
-        "Pass a task string to run it. Use --rethrow N to rerun the full task with context collapse between rethrows. " +
-        "If no task is provided, toggles an anchor/collapse point for manual use.",
+        "Execute a task autonomously in boomerang mode, then summarize context. " +
+        "Pass a task string to run it. Use --rethrow N to rerun the full task with summaries between rethrows. " +
+        "If no task is provided, toggles an anchor/summary point for manual use.",
       promptSnippet:
-        "Use when the user asks to run an autonomous boomerang pass with context collapse, or explicitly asks for boomerang mode/rethrows.",
+        "Use when the user asks to run an autonomous boomerang pass with context summarization, or explicitly asks for boomerang mode/rethrows.",
       parameters: Type.Object({
-        task: Type.Optional(Type.String({ description: "Task to execute. Supports --rethrow N for multi-pass execution with collapse between rethrows." })),
+        task: Type.Optional(Type.String({ description: "Task to execute. Supports --rethrow N for multi-pass execution with summaries between rethrows." })),
       }),
       execute: async (_id, params, _signal, _onUpdate, ctx) => {
         if (!toolEnabled) {
@@ -1712,14 +1830,14 @@ export default function (pi: ExtensionAPI) {
           }
           toolAnchorEntryId = leafId;
           return {
-            content: [{ type: "text", text: "Boomerang anchor set. Do your work, then call boomerang again to collapse the context." }],
+            content: [{ type: "text", text: "Boomerang anchor set. Do your work, then call boomerang again to summarize the context." }],
             details: {},
           };
         }
 
         toolCollapsePending = true;
         return {
-          content: [{ type: "text", text: "Boomerang complete. Context will collapse when this turn ends." }],
+          content: [{ type: "text", text: "Boomerang complete. Context will be summarized when this turn ends." }],
           details: {},
         };
       },
@@ -1794,24 +1912,27 @@ export default function (pi: ExtensionAPI) {
       toolCollapsePending = false;
 
       if (!storedCommandCtx) {
-        // Fallback: branchWithSummary then trigger new turn to pick up collapsed context
+        // Fallback: branchWithSummary then trigger a new turn to pick up summarized context
         const sm = ctx.sessionManager as SessionManager;
         const branch = sm.getBranch();
         const startIndex = branch.findIndex((entry) => entry.id === toolAnchorEntryId);
         const workEntries = startIndex >= 0 ? branch.slice(startIndex + 1) : [];
-        const summary = generateSummaryFromEntries(workEntries, "Agent-initiated task");
+        const generatedSummary = generateSummaryFromEntries(workEntries, "Agent-initiated task");
+        let shouldTriggerHandoff = false;
         try {
-          const entryId = sm.branchWithSummary(toolAnchorEntryId, summary);
+          keepBoomerangExpanded(ctx);
+          const entryId = sm.branchWithSummary(toolAnchorEntryId, generatedSummary.summary, generatedSummary.details);
           justCollapsedEntryId = entryId;
-          if (ctx.hasUI) {
-            ctx.ui.setToolsExpanded(true);
-          }
-          ctx.ui.notify("Context collapsed (agent sees it; /reload to refresh display)", "info");
+          ctx.ui.notify("Context summarized (agent sees it; /reload to refresh display)", "info");
+          shouldTriggerHandoff = true;
         } catch (err) {
-          ctx.ui.notify(`Failed to collapse: ${String(err)}`, "error");
+          ctx.ui.notify(`Failed to summarize: ${String(err)}`, "error");
         }
         toolAnchorEntryId = null;
         await restoreModelAndThinking(ctx);
+        if (shouldTriggerHandoff) {
+          triggerOrchestratorHandoff();
+        }
         return;
       }
 
@@ -1820,24 +1941,27 @@ export default function (pi: ExtensionAPI) {
       toolAnchorEntryId = null;
       pendingCollapse = { targetId, task: "Agent-initiated task", commandCtx: storedCommandCtx };
 
+      let shouldTriggerHandoff = false;
       try {
         globalThis.__boomerangCollapseInProgress = true;
+        keepBoomerangExpanded(ctx);
         const result = await storedCommandCtx.navigateTree(targetId, { summarize: true });
         if (result.cancelled) {
-          ctx.ui.notify("Collapse cancelled", "warning");
+          ctx.ui.notify("Summary cancelled", "warning");
         } else {
-          if (ctx.hasUI) {
-            ctx.ui.setToolsExpanded(true);
-          }
-          ctx.ui.notify("Boomerang complete. Context collapsed.", "info");
+          ctx.ui.notify("Boomerang complete. Context summarized.", "info");
+          shouldTriggerHandoff = true;
         }
       } catch (err) {
-        ctx.ui.notify(`Failed to collapse: ${String(err)}`, "error");
+        ctx.ui.notify(`Failed to summarize: ${String(err)}`, "error");
       } finally {
         globalThis.__boomerangCollapseInProgress = false;
       }
       pendingCollapse = null;
       await restoreModelAndThinking(ctx);
+      if (shouldTriggerHandoff) {
+        triggerOrchestratorHandoff();
+      }
       return;
     }
 
@@ -1846,26 +1970,26 @@ export default function (pi: ExtensionAPI) {
     const collapseRequest = pendingCollapse;
     const { targetId, commandCtx } = collapseRequest;
 
+    let shouldTriggerHandoff = false;
     try {
       globalThis.__boomerangCollapseInProgress = true;
+      keepBoomerangExpanded(ctx);
       const result = await commandCtx.navigateTree(targetId, { summarize: true });
       const collapseStillOwned = pendingCollapse === collapseRequest && boomerangActive;
 
       if (result.cancelled) {
-        ctx.ui.notify("Collapse cancelled", "warning");
+        ctx.ui.notify("Summary cancelled", "warning");
       } else if (!collapseStillOwned) {
-        // State changed mid-collapse (for example via /boomerang-cancel).
+        // State changed during summarization (for example via /boomerang-cancel).
       } else {
-        if (ctx.hasUI) {
-          ctx.ui.setToolsExpanded(true);
-        }
         if (anchorEntryId !== null && targetId === anchorEntryId && lastTaskSummary) {
           anchorSummaries.push(lastTaskSummary);
         }
-        ctx.ui.notify("Boomerang complete. Context collapsed.", "info");
+        ctx.ui.notify("Boomerang complete. Context summarized.", "info");
+        shouldTriggerHandoff = true;
       }
     } catch (err) {
-      ctx.ui.notify(`Failed to collapse: ${String(err)}`, "error");
+      ctx.ui.notify(`Failed to summarize: ${String(err)}`, "error");
     } finally {
       globalThis.__boomerangCollapseInProgress = false;
     }
@@ -1873,6 +1997,9 @@ export default function (pi: ExtensionAPI) {
     await restoreModelAndThinking(ctx);
     clearTaskState();
     updateStatus(ctx);
+    if (shouldTriggerHandoff) {
+      triggerOrchestratorHandoff();
+    }
   });
 
   pi.on("session_before_tree", async (event) => {
@@ -1890,11 +2017,12 @@ export default function (pi: ExtensionAPI) {
     const rethrowInfo = activeRethrowState
       ? { rethrow: activeRethrowState.currentRethrow, totalRethrows: activeRethrowState.rethrowCount }
       : undefined;
-    const summary = generateSummaryFromEntries(entries, pendingCollapse.task, config, rethrowInfo);
+    const generatedSummary = generateSummaryFromEntries(entries, pendingCollapse.task, config, rethrowInfo);
+    const summaryText = generatedSummary.summary;
 
-    // Save for accumulation after successful collapse (read by runRethrowLoop
+    // Save for accumulation after successful summarization (read by runRethrowLoop
     // for rethrows, or by agent_end for anchor accumulation in single boomerangs)
-    lastTaskSummary = summary;
+    lastTaskSummary = summaryText;
 
     // Precedence: rethrow accumulation > user-anchor accumulation > raw summary
     const isRethrowCollapse = activeRethrowState !== null && pendingCollapse.targetId === activeRethrowState.autoAnchorId;
@@ -1903,25 +2031,34 @@ export default function (pi: ExtensionAPI) {
 
     let finalSummary: string;
     if (isRethrowCollapse && activeRethrowState) {
-      finalSummary = [...activeRethrowState.rethrowSummaries, summary].join("\n\n---\n\n");
+      finalSummary = [...activeRethrowState.rethrowSummaries, summaryText].join("\n\n---\n\n");
     } else if (isAnchorCollapse) {
-      finalSummary = [...anchorSummaries, summary].join("\n\n---\n\n");
+      finalSummary = [...anchorSummaries, summaryText].join("\n\n---\n\n");
     } else {
-      finalSummary = summary;
+      finalSummary = summaryText;
     }
 
     return {
       summary: {
         summary: finalSummary,
-        details: { task: pendingCollapse.task },
+        details: generatedSummary.details,
       },
     };
   });
 
-  pi.on("session_before_compact", async (event) => {
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (boomerangActive || pendingCollapse || rethrowState || chainState || toolCollapsePending) {
+      keepBoomerangExpanded(ctx);
+    }
+
     if (justCollapsedEntryId !== null) {
       const lastEntry = event.branchEntries[event.branchEntries.length - 1];
-      if (lastEntry?.id === justCollapsedEntryId) {
+      const previousEntry = event.branchEntries[event.branchEntries.length - 2];
+      const lastIsBoomerangHandoff =
+        lastEntry?.type === "custom_message"
+        && lastEntry.customType === "boomerang-handoff"
+        && lastEntry.display === false;
+      if (lastEntry?.id === justCollapsedEntryId || (lastIsBoomerangHandoff && previousEntry?.id === justCollapsedEntryId)) {
         justCollapsedEntryId = null;
         return { cancel: true };
       }

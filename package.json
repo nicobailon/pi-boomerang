@@ -1,9 +1,11 @@
 {
   "name": "pi-boomerang",
-  "version": "0.4.5",
+  "version": "0.5.0",
   "description": "Token-efficient autonomous task execution with context collapse",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "files": [
     "index.ts",
     "README.md",
@@ -23,6 +25,8 @@
     "@mariozechner/pi-ai": "*"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }

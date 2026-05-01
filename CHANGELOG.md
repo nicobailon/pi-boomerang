@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-01
+
+### Added
+- Expanded boomerang summaries into operational handoffs with outcome, changed files, relevant reads, command counts, validation commands, failures, and config metadata.
+- Added a hidden follow-up trigger after successful boomerang returns so the orchestrator reads the new handoff summary immediately.
+
+### Fixed
+- Kept boomerang-related summary and compaction rows expanded from creation time, so Ctrl+O is never needed after a boomerang returns.
+
 ## [0.4.5] - 2026-04-30
 
 ### Fixed
