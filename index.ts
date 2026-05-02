@@ -467,6 +467,35 @@ function parseCommandArgs(argsString: string): string[] {
   return args;
 }
 
+// Extension commands are dispatched before input handlers; this list mirrors Pi's built-in control commands so auto mode does not wrap them as prompt templates.
+const PI_CONTROL_COMMANDS = new Set([
+  "settings",
+  "model",
+  "scoped-models",
+  "export",
+  "share",
+  "copy",
+  "name",
+  "session",
+  "changelog",
+  "hotkeys",
+  "fork",
+  "tree",
+  "login",
+  "logout",
+  "new",
+  "compact",
+  "resume",
+  "reload",
+  "quit",
+]);
+
+function isPiControlCommandInput(text: string): boolean {
+  const firstToken = parseCommandArgs(text.trim())[0];
+  if (!firstToken?.startsWith("/")) return false;
+  return PI_CONTROL_COMMANDS.has(firstToken.slice(1));
+}
+
 export function parseChain(task: string): {
   steps: Array<{ templateRef: string; args: string[] }>;
   globalArgs: string[];
@@ -550,6 +579,10 @@ export default function (pi: ExtensionAPI) {
   let rethrowState: RethrowState | null = null;
   let toolQueuedTask: string | null = null;
   let awaitingAssistantForTask: { afterEntryId: string | null; userTask: string } | null = null;
+  let autoBoomerangEnabled = false;
+  let autoBoomerangCandidate: { targetId: string | null; task: string } | null = null;
+  let autoFallbackCollapse: { targetId: string | null; task: string } | null = null;
+  let autoAwaitingAssistantAfterId: string | null = null;
 
   function parseFrontmatter(content: string): { frontmatter: Record<string, string>; content: string } {
     const frontmatter: Record<string, string> = {};
@@ -794,6 +827,10 @@ export default function (pi: ExtensionAPI) {
     chainState = null;
     rethrowState = null;
     awaitingAssistantForTask = null;
+    autoBoomerangEnabled = false;
+    autoBoomerangCandidate = null;
+    autoFallbackCollapse = null;
+    autoAwaitingAssistantAfterId = null;
   }
 
   function clearTaskState() {
@@ -805,6 +842,9 @@ export default function (pi: ExtensionAPI) {
     previousThinking = undefined;
     chainState = null;
     awaitingAssistantForTask = null;
+    autoBoomerangCandidate = null;
+    autoFallbackCollapse = null;
+    autoAwaitingAssistantAfterId = null;
   }
 
   function markAwaitingAssistant(
@@ -863,7 +903,21 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    for (let i = taskMessageIndex + 1; i < entries.length; i++) {
+    return hasAssistantMessageAfterIndex(entries, taskMessageIndex);
+  }
+
+  function hasAssistantMessageAfterEntry(entries: SessionEntry[], entryId: string | null): boolean {
+    const startIndex = entryId === null
+      ? -1
+      : entries.findIndex((entry) => entry.id === entryId);
+    if (entryId !== null && startIndex === -1) {
+      return false;
+    }
+    return hasAssistantMessageAfterIndex(entries, startIndex);
+  }
+
+  function hasAssistantMessageAfterIndex(entries: SessionEntry[], startIndex: number): boolean {
+    for (let i = startIndex + 1; i < entries.length; i++) {
       const entry = entries[i];
       if (entry.type === "message" && entry.message.role === "assistant") {
         return true;
@@ -1245,11 +1299,19 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("warning", `chain ${progress}`));
     } else if (boomerangActive) {
       ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("warning", "boomerang"));
+    } else if (autoBoomerangEnabled) {
+      ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("accent", "🪃 auto"));
     } else if (anchorEntryId !== null) {
       ctx.ui.setStatus("boomerang", ctx.ui.theme.fg("accent", "anchor"));
     } else {
       ctx.ui.setStatus("boomerang", undefined);
     }
+  }
+
+  function setAutoBoomerang(enabled: boolean, ctx: ExtensionContext): void {
+    autoBoomerangEnabled = enabled;
+    updateStatus(ctx);
+    ctx.ui.notify(`Auto-boomerang ${enabled ? "enabled" : "disabled"}.`, "info");
   }
 
   interface SummaryConfig {
@@ -1634,6 +1696,22 @@ export default function (pi: ExtensionAPI) {
       storedCommandCtx = ctx;
       const trimmed = args.trim();
 
+      if (trimmed === "auto" || trimmed.startsWith("auto ")) {
+        const mode = trimmed === "auto" ? "toggle" : trimmed.slice("auto".length).trim();
+        if (mode === "on") {
+          setAutoBoomerang(true, ctx);
+        } else if (mode === "off") {
+          setAutoBoomerang(false, ctx);
+        } else if (mode === "toggle") {
+          setAutoBoomerang(!autoBoomerangEnabled, ctx);
+        } else if (mode === "status") {
+          ctx.ui.notify(`Auto-boomerang is ${autoBoomerangEnabled ? "enabled" : "disabled"}.`, "info");
+        } else {
+          ctx.ui.notify("Usage: /boomerang auto [on|off|toggle|status]", "error");
+        }
+        return;
+      }
+
       if (trimmed === "anchor") {
         if (boomerangActive) {
           ctx.ui.notify("Cannot set anchor while boomerang is active", "error");
@@ -1726,7 +1804,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!trimmed) {
-        ctx.ui.notify("Usage: /boomerang <task> | anchor | tool [on|off] | guidance [text|clear]", "error");
+        ctx.ui.notify("Usage: /boomerang <task> | auto [on|off|toggle|status] | anchor | tool [on|off] | guidance [text|clear]", "error");
         return;
       }
       if (boomerangActive || chainState) {
@@ -1761,6 +1839,25 @@ export default function (pi: ExtensionAPI) {
       updateStatus(ctx);
       ctx.ui.notify("Boomerang cancelled", "info");
     },
+  });
+
+  pi.registerShortcut("ctrl+alt+b", {
+    description: "Toggle auto-boomerang mode",
+    handler: async (ctx) => {
+      setAutoBoomerang(!autoBoomerangEnabled, ctx);
+    },
+  });
+
+  pi.on("input", async (event, ctx) => {
+    autoBoomerangCandidate = null;
+    if (!autoBoomerangEnabled) return;
+    if (boomerangActive || pendingCollapse || rethrowState || chainState || toolCollapsePending || toolQueuedTask || toolAnchorEntryId) return;
+    if (!event.text.trim() || isPiControlCommandInput(event.text)) return;
+
+    autoBoomerangCandidate = {
+      targetId: ctx.sessionManager.getLeafId(),
+      task: event.text.trim(),
+    };
   });
 
   function ensureToolRegistered() {
@@ -1851,6 +1948,28 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     let systemPrompt = event.systemPrompt;
 
+    if (autoBoomerangCandidate && autoBoomerangEnabled && !boomerangActive && !pendingCollapse && !rethrowState && !chainState && !toolCollapsePending && !toolQueuedTask && !toolAnchorEntryId) {
+      const candidate = autoBoomerangCandidate;
+      autoBoomerangCandidate = null;
+      boomerangActive = true;
+      lastTaskSummary = null;
+      pendingSkill = null;
+      autoAwaitingAssistantAfterId = candidate.targetId;
+
+      if (storedCommandCtx && candidate.targetId !== null) {
+        pendingCollapse = { targetId: candidate.targetId, task: candidate.task, commandCtx: storedCommandCtx };
+        autoFallbackCollapse = null;
+      } else {
+        pendingCollapse = null;
+        autoFallbackCollapse = { targetId: candidate.targetId, task: candidate.task };
+      }
+
+      keepBoomerangExpanded(ctx);
+      updateStatus(ctx);
+    } else {
+      autoBoomerangCandidate = null;
+    }
+
     if (toolEnabled && !boomerangActive) {
       const guidance = toolGuidance
         ? `The boomerang tool is available for token-efficient task execution. ${toolGuidance}`
@@ -1879,6 +1998,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     if (rethrowState) return;
+
+    if (boomerangActive && autoAwaitingAssistantAfterId !== null) {
+      const branch = (ctx.sessionManager as SessionManager).getBranch();
+      if (!hasAssistantMessageAfterEntry(branch, autoAwaitingAssistantAfterId)) {
+        return;
+      }
+      autoAwaitingAssistantAfterId = null;
+    }
 
     if (boomerangActive && awaitingAssistantForTask !== null) {
       const branch = (ctx.sessionManager as SessionManager).getBranch();
@@ -1959,6 +2086,36 @@ export default function (pi: ExtensionAPI) {
       }
       pendingCollapse = null;
       await restoreModelAndThinking(ctx);
+      if (shouldTriggerHandoff) {
+        triggerOrchestratorHandoff();
+      }
+      return;
+    }
+
+    if (boomerangActive && autoFallbackCollapse) {
+      const fallbackCollapse = autoFallbackCollapse;
+      const sm = ctx.sessionManager as SessionManager;
+      const branch = sm.getBranch();
+      const startIndex = fallbackCollapse.targetId === null
+        ? -1
+        : branch.findIndex((entry) => entry.id === fallbackCollapse.targetId);
+      const workEntries = branch.slice(startIndex + 1);
+      const generatedSummary = generateSummaryFromEntries(workEntries, fallbackCollapse.task);
+      let shouldTriggerHandoff = false;
+
+      try {
+        keepBoomerangExpanded(ctx);
+        const entryId = sm.branchWithSummary(fallbackCollapse.targetId, generatedSummary.summary, generatedSummary.details);
+        justCollapsedEntryId = entryId;
+        ctx.ui.notify("Boomerang complete. Context summarized.", "info");
+        shouldTriggerHandoff = true;
+      } catch (err) {
+        ctx.ui.notify(`Failed to summarize: ${String(err)}`, "error");
+      }
+
+      await restoreModelAndThinking(ctx);
+      clearTaskState();
+      updateStatus(ctx);
       if (shouldTriggerHandoff) {
         triggerOrchestratorHandoff();
       }
@@ -2066,9 +2223,17 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_start", async (_event, ctx) => {
+  async function resetForSessionChange(ctx: ExtensionContext): Promise<void> {
     await restoreModelAndThinking(ctx);
     clearState();
     updateStatus(ctx);
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    await resetForSessionChange(ctx);
+  });
+
+  pi.on("session_switch", async (_event, ctx) => {
+    await resetForSessionChange(ctx);
   });
 }

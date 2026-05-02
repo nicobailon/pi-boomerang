@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-01
+
+### Added
+- Added session-only auto-boomerang mode, toggled with `Ctrl+Alt+B` or `/boomerang auto [on|off|toggle|status]`, so normal prompts can automatically run with boomerang summarization.
+
+### Fixed
+- Auto-boomerang now also wraps extension-sourced prompt-template command output, such as `/tldr` from prompt-template-model.
+
 ## [0.5.0] - 2026-05-01
 
 ### Added

@@ -175,6 +175,7 @@ describe("Boomerang Extension", () => {
   let handlers: Map<string, Function[]>;
   let commands: Map<string, { description: string; handler: Function }>;
   let tools: Map<string, { name: string; execute: Function }>;
+  let shortcuts: Map<string, { description: string; handler: Function }>;
   let sentMessages: string[];
   let sentCustomMessages: Array<{ message: { customType: string; content: string; display: boolean }; options: { triggerTurn?: boolean; deliverAs?: string } | undefined }>;
   let sessionEntries: SessionEntry[];
@@ -214,6 +215,10 @@ describe("Boomerang Extension", () => {
 
   function getTool(name: string) {
     return tools.get(name);
+  }
+
+  function getShortcut(key: string) {
+    return shortcuts.get(key)!.handler;
   }
 
   function ensureParent(filePath: string) {
@@ -370,6 +375,11 @@ describe("Boomerang Extension", () => {
     return await getHandler("before_agent_start")({ systemPrompt }, mockCtx);
   }
 
+  async function fireInput(text: string, source: "interactive" | "rpc" | "extension" = "interactive") {
+    const handler = getHandler("input");
+    return handler ? await handler({ type: "input", text, source }, mockCtx) : undefined;
+  }
+
   async function triggerAgentEnd(ctx: ExtensionContext = mockCtx) {
     agentIdle = true;
     const handler = getHandler("agent_end");
@@ -378,8 +388,12 @@ describe("Boomerang Extension", () => {
     }
   }
 
+  async function fireSessionStart() {
+    await getHandler("session_start")({ type: "session_start" }, mockCtx);
+  }
+
   async function fireSessionSwitch() {
-    await getHandler("session_start")({ reason: "resume" }, mockCtx);
+    await getHandler("session_switch")({ type: "session_switch", reason: "resume", previousSessionFile: "previous.jsonl" }, mockCtx);
   }
 
   function notifyMessages() {
@@ -410,6 +424,7 @@ describe("Boomerang Extension", () => {
     handlers = new Map();
     commands = new Map();
     tools = new Map();
+    shortcuts = new Map();
     sentMessages = [];
     sentCustomMessages = [];
     sessionEntries = [];
@@ -488,6 +503,7 @@ describe("Boomerang Extension", () => {
       }),
       registerCommand: vi.fn((name: string, options: { description: string; handler: Function }) => commands.set(name, options)),
       registerTool: vi.fn((tool: { name: string; execute: Function }) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn((key: string, options: { description: string; handler: Function }) => shortcuts.set(key, options)),
       sendUserMessage: vi.fn((content: string) => {
         agentIdle = false;
         sentMessages.push(content);
@@ -535,7 +551,7 @@ describe("Boomerang Extension", () => {
       await runBoomerang("");
 
       expect(uiMock.notify).toHaveBeenCalledWith(
-        "Usage: /boomerang <task> | anchor | tool [on|off] | guidance [text|clear]",
+        "Usage: /boomerang <task> | auto [on|off|toggle|status] | anchor | tool [on|off] | guidance [text|clear]",
         "error"
       );
       expect(sentMessages).toEqual([]);
@@ -1976,6 +1992,259 @@ describe("Boomerang Extension", () => {
 
       await triggerAgentEnd();
       expect(sentMessages).toEqual(["first queued task"]);
+    });
+  });
+
+  describe("auto-boomerang mode", () => {
+    it("toggles auto mode through /boomerang auto", async () => {
+      await runBoomerang("auto on");
+      expect(uiMock.notify).toHaveBeenCalledWith("Auto-boomerang enabled.", "info");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+
+      await runBoomerang("auto status");
+      expect(uiMock.notify).toHaveBeenLastCalledWith("Auto-boomerang is enabled.", "info");
+
+      await runBoomerang("auto off");
+      expect(uiMock.notify).toHaveBeenLastCalledWith("Auto-boomerang disabled.", "info");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+    });
+
+    it("toggles auto mode with Ctrl+Alt+B", async () => {
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Auto-boomerang enabled.", "info");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      expect(uiMock.notify).toHaveBeenLastCalledWith("Auto-boomerang disabled.", "info");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+    });
+
+    it("wraps normal prompts and waits for assistant output before summarizing", async () => {
+      await runBoomerang("auto on");
+
+      const inputResult = await fireInput("fix auth");
+      expect(inputResult).toBeUndefined();
+      expect(sentMessages).toEqual([]);
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+
+      const beforeStart = await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "fix auth", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+
+      expect(beforeStart?.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[warning]boomerang");
+
+      await triggerAgentEnd();
+      expect(navigateTreeCalls).toHaveLength(0);
+
+      addAssistantTextEntry("Fixed auth.");
+      await triggerAgentEnd();
+
+      expect(navigateTreeCalls).toHaveLength(1);
+      expect(navigateTreeCalls[0].targetId).toBe("entry-0");
+      expect(capturedSummary?.summary.summary).toContain('Task: "fix auth"');
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+      expectBoomerangHandoff();
+    });
+
+    it("falls back to branchWithSummary when shortcut enabled before a command context exists", async () => {
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      await fireInput("shortcut task");
+      const beforeStart = await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "shortcut task", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+      addAssistantTextEntry("Shortcut task done.");
+      await triggerAgentEnd();
+
+      expect(beforeStart?.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(navigateTreeCalls).toHaveLength(0);
+      expect(branchWithSummaryCalls).toHaveLength(1);
+      expect(branchWithSummaryCalls[0].summary).toContain('Task: "shortcut task"');
+      expect(branchWithSummaryCalls[0].details).toMatchObject({ task: "shortcut task" });
+      expectBoomerangHandoff();
+    });
+
+    it("falls back to branchWithSummary for the first prompt in an empty session", async () => {
+      sessionEntries = [];
+      currentLeafId = null;
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      await fireInput("first task");
+      const beforeStart = await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "first task", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+      addAssistantTextEntry("First task done.");
+      await triggerAgentEnd();
+
+      expect(beforeStart?.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(branchWithSummaryCalls).toHaveLength(1);
+      expect(branchWithSummaryCalls[0].targetId).toBeNull();
+      expect(branchWithSummaryCalls[0].summary).toContain('Task: "first task"');
+      expectBoomerangHandoff();
+    });
+
+    it("does not get stuck if a staged auto prompt never starts an agent turn", async () => {
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      await fireInput("handled elsewhere");
+      await fireInput("/model");
+      const skippedStart = await fireBeforeAgentStart("original");
+      expect(skippedStart).toBeUndefined();
+
+      await fireInput("next real prompt");
+      const beforeStart = await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "next real prompt", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+      addAssistantTextEntry("Next task done.");
+      await triggerAgentEnd();
+
+      expect(beforeStart?.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(branchWithSummaryCalls).toHaveLength(1);
+      expect(branchWithSummaryCalls[0].summary).toContain('Task: "next real prompt"');
+    });
+
+    it("does not wake the orchestrator when auto navigation is cancelled", async () => {
+      const cancellingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          return { cancelled: true };
+        }),
+      });
+      await runBoomerang("auto on", cancellingCtx);
+
+      await fireInput("cancelled auto task");
+      await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "cancelled auto task", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Summary cancelled", "warning");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("does not wake the orchestrator when auto navigation throws", async () => {
+      const throwingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          throw new Error("auto navigation failed");
+        }),
+      });
+      await runBoomerang("auto on", throwingCtx);
+
+      await fireInput("throwing auto task");
+      await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "throwing auto task", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Failed to summarize: Error: auto navigation failed", "error");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("does not wake the orchestrator when auto fallback branch summary throws", async () => {
+      const branchWithSummary = (mockCtx.sessionManager as any).branchWithSummary as ReturnType<typeof vi.fn>;
+      branchWithSummary.mockImplementationOnce(() => {
+        throw new Error("auto fallback failed");
+      });
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      await fireInput("fallback failure task");
+      await fireBeforeAgentStart("original");
+      addSessionEntry({
+        type: "message",
+        message: { role: "user", content: "fallback failure task", timestamp: Date.now() },
+        timestamp: new Date().toISOString(),
+      });
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(uiMock.notify).toHaveBeenCalledWith("Failed to summarize: Error: auto fallback failed", "error");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+      expect(sentCustomMessages).toEqual([]);
+    });
+
+    it("resets auto mode on session_start", async () => {
+      await getShortcut("ctrl+alt+b")(mockCtx);
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[accent]🪃 auto");
+
+      await fireSessionStart();
+
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+
+      await fireInput("ordinary prompt");
+      const beforeStart = await fireBeforeAgentStart("original");
+
+      expect(beforeStart).toBeUndefined();
+    });
+
+    it("resets in-flight auto mode on session_switch", async () => {
+      await getShortcut("ctrl+alt+b")(mockCtx);
+      await fireInput("switching prompt");
+      await fireBeforeAgentStart("original");
+
+      await fireSessionSwitch();
+      addAssistantTextEntry("Should not summarize.");
+      await triggerAgentEnd();
+
+      expect(navigateTreeCalls).toHaveLength(0);
+      expect(branchWithSummaryCalls).toHaveLength(0);
+      expect(sentCustomMessages).toEqual([]);
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
+    });
+
+    it("wraps extension-sourced prompt template command output", async () => {
+      await getShortcut("ctrl+alt+b")(mockCtx);
+
+      await fireInput("Expanded /tldr prompt", "extension");
+      const beforeStart = await fireBeforeAgentStart("original");
+
+      expect(beforeStart?.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[warning]boomerang");
+    });
+
+    it("does not wrap built-in Pi control commands", async () => {
+      await runBoomerang("auto on");
+
+      await fireInput("/model");
+      const beforeStart = await fireBeforeAgentStart("original");
+
+      expect(beforeStart).toBeUndefined();
+      expect(navigateTreeCalls).toHaveLength(0);
+    });
+
+    it("wraps slash prompt templates that are not Pi control commands", async () => {
+      await runBoomerang("auto on");
+
+      await fireInput("/review auth");
+      const beforeStart = await fireBeforeAgentStart("original");
+
+      expect(beforeStart?.systemPrompt).toContain("BOOMERANG MODE ACTIVE");
+      expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", "[warning]boomerang");
     });
   });
 
