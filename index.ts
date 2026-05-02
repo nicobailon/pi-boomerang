@@ -1311,7 +1311,7 @@ export default function (pi: ExtensionAPI) {
   function setAutoBoomerang(enabled: boolean, ctx: ExtensionContext): void {
     autoBoomerangEnabled = enabled;
     updateStatus(ctx);
-    ctx.ui.notify(`Auto-boomerang ${enabled ? "enabled" : "disabled"}.`, "info");
+    ctx.ui.notify(`Auto-boomerang ${enabled ? "on" : "off"}.`, "info");
   }
 
   interface SummaryConfig {
@@ -1705,7 +1705,7 @@ export default function (pi: ExtensionAPI) {
         } else if (mode === "toggle") {
           setAutoBoomerang(!autoBoomerangEnabled, ctx);
         } else if (mode === "status") {
-          ctx.ui.notify(`Auto-boomerang is ${autoBoomerangEnabled ? "enabled" : "disabled"}.`, "info");
+          ctx.ui.notify(`Auto-boomerang is ${autoBoomerangEnabled ? "on" : "off"}.`, "info");
         } else {
           ctx.ui.notify("Usage: /boomerang auto [on|off|toggle|status]", "error");
         }
@@ -1951,6 +1951,7 @@ export default function (pi: ExtensionAPI) {
     if (autoBoomerangCandidate && autoBoomerangEnabled && !boomerangActive && !pendingCollapse && !rethrowState && !chainState && !toolCollapsePending && !toolQueuedTask && !toolAnchorEntryId) {
       const candidate = autoBoomerangCandidate;
       autoBoomerangCandidate = null;
+      autoBoomerangEnabled = false;
       boomerangActive = true;
       lastTaskSummary = null;
       pendingSkill = null;

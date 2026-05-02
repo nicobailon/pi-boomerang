@@ -60,7 +60,7 @@ Then restart pi to load the extension.
 # Chain templates together
 /boomerang /scout "map the auth module" -> /planner "design JWT refresh" -> /impl
 
-# Toggle auto-boomerang mode for every normal prompt
+# Turn on auto-boomerang for the next normal prompt
 # Shortcut: Ctrl+Alt+B
 /boomerang auto on
 
@@ -156,9 +156,9 @@ Commit current work. $@
 
 ## Auto Mode
 
-Press `Ctrl+Alt+B` or run `/boomerang auto on` to make every normal submitted prompt run as a boomerang task. Auto mode includes prompt templates such as `/review`, but it does not wrap Pi control commands like `/boomerang`, `/model`, or `/tree`.
+Press `Ctrl+Alt+B` or run `/boomerang auto on` to turn on auto-boomerang for the next normal submitted prompt. Auto mode includes prompt templates such as `/review`, but it does not wrap Pi control commands like `/boomerang`, `/model`, or `/tree`.
 
-Auto mode is session-only and resets when a session starts. Use `/boomerang auto off`, `/boomerang auto toggle`, or `Ctrl+Alt+B` again to turn it off. The footer shows `🪃 auto` while it is enabled and idle. If you enable it with the shortcut before any `/boomerang` command has initialized a command context, the first summary may need `/reload` to refresh the display; the agent still receives the summarized context.
+Auto mode is session-only and one-shot: it turns off after it wraps the next prompt, so re-enable it each time you want an automatic checkpoint. Use `/boomerang auto off`, `/boomerang auto toggle`, or `Ctrl+Alt+B` again to turn it off before the next prompt. The footer shows `🪃 auto` while it is on and idle. If you enable it with the shortcut before any `/boomerang` command has initialized a command context, the first summary may need `/reload` to refresh the display; the agent still receives the summarized context.
 
 ## Anchor Mode
 
@@ -210,8 +210,8 @@ One quirk: tool-initiated anchor summaries may not update the UI immediately (th
 
 | Command | What it does |
 |---------|--------------|
-| `Ctrl+Alt+B` | Toggle auto-boomerang mode |
-| `/boomerang auto [on\|off\|toggle\|status]` | Control auto-boomerang mode for normal prompts |
+| `Ctrl+Alt+B` | Turn auto-boomerang on or off for the next prompt |
+| `/boomerang auto [on\|off\|toggle\|status]` | Control one-shot auto-boomerang mode for normal prompts |
 | `/boomerang <task>` | Execute and summarize context |
 | `/boomerang <task> --rethrow N` | Re-run full task N times with summaries between rethrows |
 | `/boomerang <task> --loop N` | Alias for `--rethrow N` in boomerang mode |
