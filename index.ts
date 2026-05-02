@@ -1247,6 +1247,7 @@ export default function (pi: ExtensionAPI) {
           break;
         }
         if (!boomerangActive || !rethrowState) break;
+        justCollapsedEntryId = commandCtx.sessionManager.getLeafId();
 
         if (lastTaskSummary) {
           rethrowState.rethrowSummaries.push(lastTaskSummary);
@@ -2077,6 +2078,7 @@ export default function (pi: ExtensionAPI) {
         if (result.cancelled) {
           ctx.ui.notify("Summary cancelled", "warning");
         } else {
+          justCollapsedEntryId = storedCommandCtx.sessionManager.getLeafId();
           ctx.ui.notify("Boomerang complete. Context summarized.", "info");
           shouldTriggerHandoff = true;
         }
@@ -2140,6 +2142,7 @@ export default function (pi: ExtensionAPI) {
       } else if (!collapseStillOwned) {
         // State changed during summarization (for example via /boomerang-cancel).
       } else {
+        justCollapsedEntryId = commandCtx.sessionManager.getLeafId();
         if (anchorEntryId !== null && targetId === anchorEntryId && lastTaskSummary) {
           anchorSummaries.push(lastTaskSummary);
         }

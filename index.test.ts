@@ -323,25 +323,44 @@ describe("Boomerang Extension", () => {
     });
   }
 
+  async function captureTreeSummary(targetId: string) {
+    const handler = getHandler("session_before_tree");
+    if (!handler) return;
+
+    const startIndex = sessionEntries.findIndex((entry) => entry.id === targetId);
+    const entriesToSummarize = startIndex >= 0 ? sessionEntries.slice(startIndex + 1) : sessionEntries;
+    capturedSummary = await handler(
+      {
+        preparation: {
+          targetId,
+          oldLeafId: currentLeafId,
+          entriesToSummarize,
+          userWantsSummary: true,
+        },
+      },
+      mockCtx
+    );
+  }
+
+  function appendCapturedBranchSummary(id: string, parentId: string | null = currentLeafId) {
+    if (!capturedSummary?.summary) return;
+
+    sessionEntries.push({
+      id,
+      parentId,
+      timestamp: new Date().toISOString(),
+      type: "branch_summary",
+      fromId: parentId ?? "root",
+      summary: capturedSummary.summary.summary,
+      details: capturedSummary.summary.details,
+    });
+    currentLeafId = id;
+  }
+
   function createCommandCtx(overrides: Partial<ExtensionCommandContext> = {}) {
     const navigateTree = vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
       navigateTreeCalls.push({ targetId, options });
-      const handler = getHandler("session_before_tree");
-      if (handler) {
-        const startIndex = sessionEntries.findIndex((entry) => entry.id === targetId);
-        const entriesToSummarize = startIndex >= 0 ? sessionEntries.slice(startIndex + 1) : sessionEntries;
-        capturedSummary = await handler(
-          {
-            preparation: {
-              targetId,
-              oldLeafId: currentLeafId,
-              entriesToSummarize,
-              userWantsSummary: true,
-            },
-          },
-          mockCtx
-        );
-      }
+      await captureTreeSummary(targetId);
       return { cancelled: false };
     });
 
@@ -386,6 +405,23 @@ describe("Boomerang Extension", () => {
     if (handler) {
       await handler({}, ctx);
     }
+  }
+
+  function makeBeforeCompactEvent(): SessionBeforeCompactEvent {
+    return {
+      type: "session_before_compact",
+      branchEntries: sessionEntries,
+      preparation: {
+        firstKeptEntryId: currentLeafId ?? "entry-0",
+        messagesToSummarize: [],
+        turnPrefixMessages: [],
+        isSplitTurn: false,
+        tokensBefore: 0,
+        fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+        settings: DEFAULT_COMPACTION_SETTINGS,
+      },
+      signal: new AbortController().signal,
+    };
   }
 
   async function fireSessionStart() {
@@ -1640,20 +1676,7 @@ describe("Boomerang Extension", () => {
       await runBoomerang("fix auth");
       uiMock.setToolsExpanded.mockClear();
 
-      const event: SessionBeforeCompactEvent = {
-        type: "session_before_compact",
-        branchEntries: sessionEntries,
-        preparation: {
-          firstKeptEntryId: currentLeafId ?? "entry-0",
-          messagesToSummarize: [],
-          turnPrefixMessages: [],
-          isSplitTurn: false,
-          tokensBefore: 0,
-          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-          settings: DEFAULT_COMPACTION_SETTINGS,
-        },
-        signal: new AbortController().signal,
-      };
+      const event = makeBeforeCompactEvent();
 
       await getHandler("session_before_compact")(event, mockCtx);
 
@@ -1783,6 +1806,78 @@ describe("Boomerang Extension", () => {
       expect(sentCustomMessages).toEqual([]);
     });
 
+    it("cancels compaction after navigateTree summary followed by hidden handoff", async () => {
+      const navigatingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          await captureTreeSummary(targetId);
+          appendCapturedBranchSummary("navigate-summary", targetId);
+          return { cancelled: false };
+        }),
+      });
+
+      await runBoomerang("fix auth", navigatingCtx);
+      addAssistantTextEntry("Done.");
+      await triggerAgentEnd();
+
+      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe("navigate-summary");
+      expectBoomerangHandoff();
+
+      const event = makeBeforeCompactEvent();
+
+      await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toEqual({ cancel: true });
+    });
+
+    it("cancels compaction after stored-context tool navigateTree summary", async () => {
+      const navigatingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          await captureTreeSummary(targetId);
+          appendCapturedBranchSummary("tool-navigate-summary", targetId);
+          return { cancelled: false };
+        }),
+      });
+      await runBoomerang("tool on", navigatingCtx);
+
+      const tool = getTool("boomerang");
+      await tool.execute("id-1", {}, undefined, undefined, mockCtx);
+      addAssistantTextEntry("tool work");
+      await tool.execute("id-2", {}, undefined, undefined, mockCtx);
+      await triggerAgentEnd();
+
+      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe("tool-navigate-summary");
+      expectBoomerangHandoff();
+
+      const event = makeBeforeCompactEvent();
+
+      await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toEqual({ cancel: true });
+    });
+
+    it("cancels compaction after rethrow navigateTree summary", async () => {
+      writePrompt("user", "task", "Task $@");
+      const navigatingCtx = createCommandCtx({
+        navigateTree: vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+          navigateTreeCalls.push({ targetId, options });
+          await captureTreeSummary(targetId);
+          appendCapturedBranchSummary("rethrow-navigate-summary", targetId);
+          return { cancelled: false };
+        }),
+      });
+      waitForIdleMock.mockImplementation(async () => {
+        addAssistantTextEntry("rethrow done");
+        agentIdle = true;
+      });
+
+      await runBoomerang("/task auth --rethrow 1", navigatingCtx);
+
+      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe("rethrow-navigate-summary");
+      expectBoomerangHandoff();
+
+      const event = makeBeforeCompactEvent();
+
+      await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toEqual({ cancel: true });
+    });
+
     it("cancels compaction after fallback summary followed by hidden handoff", async () => {
       await runBoomerang("tool on");
       await fireSessionSwitch();
@@ -1797,20 +1892,7 @@ describe("Boomerang Extension", () => {
       expect(sessionEntries[sessionEntries.length - 2]?.id).toBe(branchWithSummaryCalls[0].entryId);
       expect(sessionEntries[sessionEntries.length - 1]?.type).toBe("custom_message");
 
-      const event: SessionBeforeCompactEvent = {
-        type: "session_before_compact",
-        branchEntries: sessionEntries,
-        preparation: {
-          firstKeptEntryId: currentLeafId ?? "entry-0",
-          messagesToSummarize: [],
-          turnPrefixMessages: [],
-          isSplitTurn: false,
-          tokensBefore: 0,
-          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-          settings: DEFAULT_COMPACTION_SETTINGS,
-        },
-        signal: new AbortController().signal,
-      };
+      const event = makeBeforeCompactEvent();
 
       await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toEqual({ cancel: true });
     });
@@ -1826,20 +1908,7 @@ describe("Boomerang Extension", () => {
       await triggerAgentEnd();
       addAssistantTextEntry("later work");
 
-      const event: SessionBeforeCompactEvent = {
-        type: "session_before_compact",
-        branchEntries: sessionEntries,
-        preparation: {
-          firstKeptEntryId: currentLeafId ?? "entry-0",
-          messagesToSummarize: [],
-          turnPrefixMessages: [],
-          isSplitTurn: false,
-          tokensBefore: 0,
-          fileOps: { read: new Set(), written: new Set(), edited: new Set() },
-          settings: DEFAULT_COMPACTION_SETTINGS,
-        },
-        signal: new AbortController().signal,
-      };
+      const event = makeBeforeCompactEvent();
 
       await expect(getHandler("session_before_compact")(event, mockCtx)).resolves.toBeUndefined();
     });
