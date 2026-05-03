@@ -11,7 +11,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, SessionEntry, SessionManager } from "@mariozechner/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext, type SessionEntry, type SessionManager } from "@mariozechner/pi-coding-agent";
 import type { AssistantMessage, Model } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
 
@@ -566,6 +566,7 @@ export default function (pi: ExtensionAPI) {
   let toolAnchorEntryId: string | null = null;
   let toolCollapsePending = false;
   let storedCommandCtx: ExtensionCommandContext | null = null;
+  let reloadFallbackDisplay: (() => Promise<void>) | null = null;
   let justCollapsedEntryId: string | null = null;
 
   const initialConfig = loadConfig();
@@ -822,6 +823,7 @@ export default function (pi: ExtensionAPI) {
     toolCollapsePending = false;
     toolQueuedTask = null;
     storedCommandCtx = null;
+    reloadFallbackDisplay = null;
     justCollapsedEntryId = null;
     pendingSkill = null;
     previousModel = undefined;
@@ -1273,7 +1275,7 @@ export default function (pi: ExtensionAPI) {
       updateStatus(ctx);
       if (completedNormally && handoffSummary) {
         ctx.ui.notify(`Rethrow complete: ${totalRethrows}/${totalRethrows}`, "info");
-        triggerOrchestratorHandoff(handoffSummary);
+        triggerHiddenOrchestratorHandoff(handoffSummary);
       }
     }
   }
@@ -1284,12 +1286,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function triggerOrchestratorHandoff(summary: string) {
-    pi.sendMessage({
-      customType: "boomerang-summary",
-      content: summary,
-      display: true,
-    });
+  function triggerHiddenOrchestratorHandoff(summary: string) {
     pi.sendMessage({
       customType: "boomerang-handoff",
       content: [
@@ -1306,6 +1303,59 @@ export default function (pi: ExtensionAPI) {
       triggerTurn: true,
       deliverAs: "followUp",
     });
+  }
+
+  async function submitReloadThroughEditor(ctx: ExtensionContext): Promise<void> {
+    const editorText = ctx.ui.getEditorText();
+    let editorRef: CustomEditor | null = null;
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      editorRef = new CustomEditor(tui, theme, keybindings);
+      return editorRef;
+    });
+
+    if (!editorRef?.onSubmit) {
+      throw new Error("temporary editor was not wired for submission");
+    }
+
+    try {
+      await editorRef.onSubmit("/reload");
+    } finally {
+      if (editorText.length > 0) {
+        ctx.ui.setEditorText(editorText);
+      }
+    }
+  }
+
+  async function reloadFallbackChatDisplay(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.hasUI) return;
+
+    if (reloadFallbackDisplay) {
+      try {
+        await reloadFallbackDisplay();
+      } catch (error) {
+        ctx.ui.notify(`Boomerang summary created, but chat reload failed: ${String(error)}`, "warning");
+      }
+      return;
+    }
+
+    try {
+      await submitReloadThroughEditor(ctx);
+    } catch (error) {
+      ctx.ui.notify(`Boomerang summary created, but automatic /reload failed: ${String(error)}`, "warning");
+    }
+  }
+
+  function triggerFallbackOrchestratorHandoff(summary: string, ctx: ExtensionContext) {
+    setTimeout(() => {
+      void (async () => {
+        try {
+          await reloadFallbackChatDisplay(ctx);
+          triggerHiddenOrchestratorHandoff(summary);
+        } catch (error) {
+          ctx.ui.notify(`Boomerang handoff failed: ${String(error)}`, "warning");
+        }
+      })();
+    }, 0);
   }
 
   function updateStatus(ctx: ExtensionContext) {
@@ -1716,6 +1766,7 @@ export default function (pi: ExtensionAPI) {
     description: "Execute task autonomously, then summarize context",
     handler: async (args, ctx) => {
       storedCommandCtx = ctx;
+      reloadFallbackDisplay = () => ctx.reload();
       const trimmed = args.trim();
 
       if (trimmed === "auto" || trimmed.startsWith("auto ")) {
@@ -2074,7 +2125,7 @@ export default function (pi: ExtensionAPI) {
           keepBoomerangExpanded(ctx);
           const entryId = sm.branchWithSummary(toolAnchorEntryId, generatedSummary.summary, generatedSummary.details);
           justCollapsedEntryId = entryId;
-          ctx.ui.notify("Context summarized (agent sees it; /reload to refresh display)", "info");
+          ctx.ui.notify("Context summarized.", "info");
           shouldTriggerHandoff = true;
         } catch (err) {
           ctx.ui.notify(`Failed to summarize: ${String(err)}`, "error");
@@ -2082,7 +2133,7 @@ export default function (pi: ExtensionAPI) {
         toolAnchorEntryId = null;
         await restoreModelAndThinking(ctx);
         if (shouldTriggerHandoff) {
-          triggerOrchestratorHandoff(generatedSummary.summary);
+          triggerFallbackOrchestratorHandoff(generatedSummary.summary, ctx);
         }
         return;
       }
@@ -2116,7 +2167,7 @@ export default function (pi: ExtensionAPI) {
       pendingCollapse = null;
       await restoreModelAndThinking(ctx);
       if (shouldTriggerHandoff && handoffSummary) {
-        triggerOrchestratorHandoff(handoffSummary);
+        triggerHiddenOrchestratorHandoff(handoffSummary);
       }
       return;
     }
@@ -2146,7 +2197,7 @@ export default function (pi: ExtensionAPI) {
       clearTaskState();
       updateStatus(ctx);
       if (shouldTriggerHandoff) {
-        triggerOrchestratorHandoff(generatedSummary.summary);
+        triggerFallbackOrchestratorHandoff(generatedSummary.summary, ctx);
       }
       return;
     }
@@ -2187,7 +2238,7 @@ export default function (pi: ExtensionAPI) {
     clearTaskState();
     updateStatus(ctx);
     if (shouldTriggerHandoff && handoffSummary) {
-      triggerOrchestratorHandoff(handoffSummary);
+      triggerHiddenOrchestratorHandoff(handoffSummary);
     }
   });
 
@@ -2246,10 +2297,7 @@ export default function (pi: ExtensionAPI) {
       let tailIndex = event.branchEntries.length - 1;
       while (tailIndex >= 0) {
         const entry = event.branchEntries[tailIndex];
-        if (
-          entry.type !== "custom_message"
-          || (entry.customType !== "boomerang-summary" && entry.customType !== "boomerang-handoff")
-        ) {
+        if (entry.type !== "custom_message" || entry.customType !== "boomerang-handoff") {
           break;
         }
         tailIndex--;

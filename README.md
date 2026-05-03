@@ -158,7 +158,7 @@ Commit current work. $@
 
 Press `Ctrl+Alt+B` or run `/boomerang auto on` to turn on auto-boomerang for the next normal submitted prompt. Auto mode includes prompt templates such as `/review`, but it does not wrap Pi control commands like `/boomerang`, `/model`, or `/tree`.
 
-Auto mode is session-only and one-shot: it turns off after it wraps the next prompt, so re-enable it each time you want an automatic checkpoint. Use `/boomerang auto off`, `/boomerang auto toggle`, or `Ctrl+Alt+B` again to turn it off before the next prompt. The footer shows `🪃 auto` while it is on and idle. If you enable it with the shortcut before any `/boomerang` command has initialized a command context, the first summary may need `/reload` to refresh the display; the agent still receives the summarized context.
+Auto mode is session-only and one-shot: it turns off after it wraps the next prompt, so re-enable it each time you want an automatic checkpoint. Use `/boomerang auto off`, `/boomerang auto toggle`, or `Ctrl+Alt+B` again to turn it off before the next prompt. The footer shows `🪃 auto` while it is on and idle. Fallback summaries auto-refresh the chat with `/reload` so raw branch content is removed from the display after the summary is created.
 
 ## Anchor Mode
 

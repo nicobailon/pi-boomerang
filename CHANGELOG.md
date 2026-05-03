@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-05-03
+
+### Fixed
+- Auto-refresh fallback boomerang summaries with `/reload`, including shortcut-first auto mode before any `/boomerang` command has initialized a command context, so stale raw branch content is not left visible after the summary appears.
+- Preserve draft editor text while auto-refreshing shortcut-first fallback summaries through the temporary `/reload` editor path.
+- Removed the duplicate visible `boomerang-summary` message; the branch summary remains the single visible summary while the hidden handoff still wakes the orchestrator.
+- Declared `@mariozechner/pi-coding-agent` as a peer dependency now that boomerang imports `CustomEditor` at runtime.
+
 ## [0.6.4] - 2026-05-02
 
 ### Fixed
