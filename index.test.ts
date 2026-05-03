@@ -437,8 +437,13 @@ describe("Boomerang Extension", () => {
   }
 
   function expectBoomerangHandoff(count = 1, expectedSummary?: string) {
-    expect(sentCustomMessages).toHaveLength(count);
-    const handoff = sentCustomMessages[count - 1];
+    expect(sentCustomMessages).toHaveLength(count * 2);
+    const visibleSummary = sentCustomMessages[count * 2 - 2];
+    const handoff = sentCustomMessages[count * 2 - 1];
+    expect(visibleSummary.message.customType).toBe("boomerang-summary");
+    expect(visibleSummary.message.display).toBe(true);
+    expect(visibleSummary.options).toBeUndefined();
+    expect(visibleSummary.message.content).toContain("[BOOMERANG COMPLETE");
     expect(handoff.message.customType).toBe("boomerang-handoff");
     expect(handoff.message.display).toBe(false);
     expect(handoff.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
@@ -448,6 +453,7 @@ describe("Boomerang Extension", () => {
     expect(handoff.message.content).toContain("<boomerang-summary>\n[BOOMERANG COMPLETE");
     expect(handoff.message.content).toContain("</boomerang-summary>");
     if (expectedSummary) {
+      expect(visibleSummary.message.content).toContain(expectedSummary);
       expect(handoff.message.content).toContain(expectedSummary);
     }
   }
@@ -1824,7 +1830,7 @@ describe("Boomerang Extension", () => {
       addAssistantTextEntry("Done.");
       await triggerAgentEnd();
 
-      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe("navigate-summary");
+      expect(sessionEntries[sessionEntries.length - 3]?.id).toBe("navigate-summary");
       expectBoomerangHandoff();
 
       const event = makeBeforeCompactEvent();
@@ -1849,7 +1855,7 @@ describe("Boomerang Extension", () => {
       await tool.execute("id-2", {}, undefined, undefined, mockCtx);
       await triggerAgentEnd();
 
-      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe("tool-navigate-summary");
+      expect(sessionEntries[sessionEntries.length - 3]?.id).toBe("tool-navigate-summary");
       expectBoomerangHandoff();
 
       const event = makeBeforeCompactEvent();
@@ -1874,7 +1880,7 @@ describe("Boomerang Extension", () => {
 
       await runBoomerang("/task auth --rethrow 1", navigatingCtx);
 
-      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe("rethrow-navigate-summary");
+      expect(sessionEntries[sessionEntries.length - 3]?.id).toBe("rethrow-navigate-summary");
       expectBoomerangHandoff();
 
       const event = makeBeforeCompactEvent();
@@ -1893,8 +1899,9 @@ describe("Boomerang Extension", () => {
       await triggerAgentEnd();
 
       expect(branchWithSummaryCalls).toHaveLength(1);
-      expect(sessionEntries[sessionEntries.length - 2]?.id).toBe(branchWithSummaryCalls[0].entryId);
-      expect(sessionEntries[sessionEntries.length - 1]?.type).toBe("custom_message");
+      expect(sessionEntries[sessionEntries.length - 3]?.id).toBe(branchWithSummaryCalls[0].entryId);
+      expect(sessionEntries[sessionEntries.length - 2]?.customType).toBe("boomerang-summary");
+      expect(sessionEntries[sessionEntries.length - 1]?.customType).toBe("boomerang-handoff");
       expectBoomerangHandoff(1, branchWithSummaryCalls[0].summary);
 
       const event = makeBeforeCompactEvent();

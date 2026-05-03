@@ -1286,6 +1286,11 @@ export default function (pi: ExtensionAPI) {
 
   function triggerOrchestratorHandoff(summary: string) {
     pi.sendMessage({
+      customType: "boomerang-summary",
+      content: summary,
+      display: true,
+    });
+    pi.sendMessage({
       customType: "boomerang-handoff",
       content: [
         "A boomerang task completed. The handoff summary is included below.",
@@ -2238,13 +2243,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (justCollapsedEntryId !== null) {
-      const lastEntry = event.branchEntries[event.branchEntries.length - 1];
-      const previousEntry = event.branchEntries[event.branchEntries.length - 2];
-      const lastIsBoomerangHandoff =
-        lastEntry?.type === "custom_message"
-        && lastEntry.customType === "boomerang-handoff"
-        && lastEntry.display === false;
-      if (lastEntry?.id === justCollapsedEntryId || (lastIsBoomerangHandoff && previousEntry?.id === justCollapsedEntryId)) {
+      let tailIndex = event.branchEntries.length - 1;
+      while (tailIndex >= 0) {
+        const entry = event.branchEntries[tailIndex];
+        if (
+          entry.type !== "custom_message"
+          || (entry.customType !== "boomerang-summary" && entry.customType !== "boomerang-handoff")
+        ) {
+          break;
+        }
+        tailIndex--;
+      }
+      if (event.branchEntries[tailIndex]?.id === justCollapsedEntryId) {
         justCollapsedEntryId = null;
         return { cancel: true };
       }

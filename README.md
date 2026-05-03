@@ -10,7 +10,7 @@
 /boomerang Fix the login bug
 ```
 
-The agent executes autonomously. When done, the raw turn history is replaced in future context by an expanded handoff summary—work gets done, tokens get saved, and the orchestrator immediately gets a self-contained follow-up turn with the summary included.
+The agent executes autonomously. When done, the raw turn history is replaced in future context by an expanded handoff summary—work gets done, tokens get saved, the summary is shown in chat, and the orchestrator immediately gets a self-contained follow-up turn with the summary included.
 
 ## Why
 
@@ -68,7 +68,7 @@ Then restart pi to load the extension.
 /boomerang-cancel
 ```
 
-The agent works without asking questions, making reasonable assumptions. When complete, everything returns into a summary branch. The summary stays expanded in the UI and includes operational handoff context such as changed files, relevant reads, validation commands, failures, model/thinking/skill config, and the final outcome. The hidden follow-up given to the orchestrator includes that summary directly and tells the agent not to search session logs just to find it.
+The agent works without asking questions, making reasonable assumptions. When complete, everything returns into a summary branch. The summary is shown in chat, stays expanded in the UI, and includes operational handoff context such as changed files, relevant reads, validation commands, failures, model/thinking/skill config, and the final outcome. The hidden follow-up given to the orchestrator includes that summary directly and tells the agent not to search session logs just to find it.
 
 ## Chain Execution
 

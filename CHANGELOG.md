@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-05-02
+
+### Fixed
+- Show the boomerang summary in chat while keeping the hidden self-contained orchestrator handoff.
+
 ## [0.6.3] - 2026-05-02
 
 ### Fixed

@@ -1,6 +1,6 @@
 {
   "name": "pi-boomerang",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "Token-efficient autonomous task execution with context collapse",
   "type": "module",
   "keywords": [
