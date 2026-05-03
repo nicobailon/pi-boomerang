@@ -436,16 +436,20 @@ describe("Boomerang Extension", () => {
     return uiMock.notify.mock.calls.map(([message, level]: [string, string]) => ({ message, level }));
   }
 
-  function expectBoomerangHandoff(count = 1) {
+  function expectBoomerangHandoff(count = 1, expectedSummary?: string) {
     expect(sentCustomMessages).toHaveLength(count);
-    expect(sentCustomMessages[count - 1]).toEqual({
-      message: {
-        customType: "boomerang-handoff",
-        content: "A boomerang task completed. Read the latest [BOOMERANG COMPLETE] summary and continue from it.",
-        display: false,
-      },
-      options: { triggerTurn: true, deliverAs: "followUp" },
-    });
+    const handoff = sentCustomMessages[count - 1];
+    expect(handoff.message.customType).toBe("boomerang-handoff");
+    expect(handoff.message.display).toBe(false);
+    expect(handoff.options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+    expect(handoff.message.content).toContain("A boomerang task completed. The handoff summary is included below.");
+    expect(handoff.message.content).toContain("Use this summary directly. Do not search session files, memory files, or logs for it.");
+    expect(handoff.message.content).toContain("If nothing is pending, respond with a concise completion note.");
+    expect(handoff.message.content).toContain("<boomerang-summary>\n[BOOMERANG COMPLETE");
+    expect(handoff.message.content).toContain("</boomerang-summary>");
+    if (expectedSummary) {
+      expect(handoff.message.content).toContain(expectedSummary);
+    }
   }
 
   beforeEach(() => {
@@ -1161,7 +1165,7 @@ describe("Boomerang Extension", () => {
       expect(navigateTreeCalls).toHaveLength(2);
       expect(uiMock.notify).toHaveBeenCalledWith("Rethrow started: 2 iterations", "info");
       expect(uiMock.notify).toHaveBeenCalledWith("Rethrow complete: 2/2", "info");
-      expectBoomerangHandoff();
+      expectBoomerangHandoff(1, capturedSummary?.summary.summary);
     });
 
     it("treats --loop N as a rethrow alias for boomerang templates", async () => {
@@ -1688,7 +1692,7 @@ describe("Boomerang Extension", () => {
       addAssistantTextEntry("Done.");
       await triggerAgentEnd();
 
-      expectBoomerangHandoff();
+      expectBoomerangHandoff(1, capturedSummary?.summary.summary);
     });
 
     it("does not wake the orchestrator when normal summarization is cancelled", async () => {
@@ -1765,7 +1769,7 @@ describe("Boomerang Extension", () => {
 
       expect(navigateTreeCalls).toHaveLength(1);
       expect(navigateTreeCalls[0].options).toEqual({ summarize: true });
-      expectBoomerangHandoff();
+      expectBoomerangHandoff(1, capturedSummary?.summary.summary);
     });
 
     it("does not wake the orchestrator when stored-context tool summarization is cancelled", async () => {
@@ -1891,6 +1895,7 @@ describe("Boomerang Extension", () => {
       expect(branchWithSummaryCalls).toHaveLength(1);
       expect(sessionEntries[sessionEntries.length - 2]?.id).toBe(branchWithSummaryCalls[0].entryId);
       expect(sessionEntries[sessionEntries.length - 1]?.type).toBe("custom_message");
+      expectBoomerangHandoff(1, branchWithSummaryCalls[0].summary);
 
       const event = makeBeforeCompactEvent();
 
@@ -2118,7 +2123,7 @@ describe("Boomerang Extension", () => {
       expect(navigateTreeCalls[0].targetId).toBe("entry-0");
       expect(capturedSummary?.summary.summary).toContain('Task: "fix auth"');
       expect(uiMock.setStatus).toHaveBeenLastCalledWith("boomerang", undefined);
-      expectBoomerangHandoff();
+      expectBoomerangHandoff(1, capturedSummary?.summary.summary);
     });
 
     it("falls back to branchWithSummary when shortcut enabled before a command context exists", async () => {
@@ -2139,7 +2144,7 @@ describe("Boomerang Extension", () => {
       expect(branchWithSummaryCalls).toHaveLength(1);
       expect(branchWithSummaryCalls[0].summary).toContain('Task: "shortcut task"');
       expect(branchWithSummaryCalls[0].details).toMatchObject({ task: "shortcut task" });
-      expectBoomerangHandoff();
+      expectBoomerangHandoff(1, branchWithSummaryCalls[0].summary);
     });
 
     it("turns auto mode off after wrapping one prompt", async () => {
@@ -2185,7 +2190,7 @@ describe("Boomerang Extension", () => {
       expect(branchWithSummaryCalls).toHaveLength(1);
       expect(branchWithSummaryCalls[0].targetId).toBeNull();
       expect(branchWithSummaryCalls[0].summary).toContain('Task: "first task"');
-      expectBoomerangHandoff();
+      expectBoomerangHandoff(1, branchWithSummaryCalls[0].summary);
     });
 
     it("does not get stuck if a staged auto prompt never starts an agent turn", async () => {

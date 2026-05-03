@@ -561,6 +561,7 @@ export default function (pi: ExtensionAPI) {
   } | null = null;
 
   let lastTaskSummary: string | null = null;
+  let lastHandoffSummary: string | null = null;
 
   let toolAnchorEntryId: string | null = null;
   let toolCollapsePending = false;
@@ -816,6 +817,7 @@ export default function (pi: ExtensionAPI) {
     anchorSummaries = [];
     pendingCollapse = null;
     lastTaskSummary = null;
+    lastHandoffSummary = null;
     toolAnchorEntryId = null;
     toolCollapsePending = false;
     toolQueuedTask = null;
@@ -837,6 +839,7 @@ export default function (pi: ExtensionAPI) {
     boomerangActive = false;
     pendingCollapse = null;
     lastTaskSummary = null;
+    lastHandoffSummary = null;
     pendingSkill = null;
     previousModel = undefined;
     previousThinking = undefined;
@@ -1090,6 +1093,7 @@ export default function (pi: ExtensionAPI) {
         let injectedSkill: string | undefined;
         let taskDisplayName = currentRethrow.baseTask;
         lastTaskSummary = null;
+        lastHandoffSummary = null;
 
         if (currentRethrow.isChain) {
           const parsed = parseChain(currentRethrow.baseTask);
@@ -1260,13 +1264,16 @@ export default function (pi: ExtensionAPI) {
       }
     } finally {
       const completedNormally = rethrowState !== null && boomerangActive && completedRethrows === totalRethrows;
+      const handoffSummary = completedNormally
+        ? lastHandoffSummary ?? rethrowState?.rethrowSummaries.join("\n\n---\n\n") ?? null
+        : null;
       await restoreModelAndThinking(ctx);
       rethrowState = null;
       clearTaskState();
       updateStatus(ctx);
-      if (completedNormally) {
+      if (completedNormally && handoffSummary) {
         ctx.ui.notify(`Rethrow complete: ${totalRethrows}/${totalRethrows}`, "info");
-        triggerOrchestratorHandoff();
+        triggerOrchestratorHandoff(handoffSummary);
       }
     }
   }
@@ -1277,10 +1284,18 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function triggerOrchestratorHandoff() {
+  function triggerOrchestratorHandoff(summary: string) {
     pi.sendMessage({
       customType: "boomerang-handoff",
-      content: "A boomerang task completed. Read the latest [BOOMERANG COMPLETE] summary and continue from it.",
+      content: [
+        "A boomerang task completed. The handoff summary is included below.",
+        "",
+        "Use this summary directly. Do not search session files, memory files, or logs for it. Only inspect project files if the next task requires it. If nothing is pending, respond with a concise completion note.",
+        "",
+        "<boomerang-summary>",
+        summary,
+        "</boomerang-summary>",
+      ].join("\n"),
       display: false,
     }, {
       triggerTurn: true,
@@ -1548,6 +1563,7 @@ export default function (pi: ExtensionAPI) {
       toolCollapsePending = false;
       pendingCollapse = null;
       lastTaskSummary = null;
+      lastHandoffSummary = null;
       pendingSkill = null;
       chainState = null;
 
@@ -1955,6 +1971,7 @@ export default function (pi: ExtensionAPI) {
       autoBoomerangEnabled = false;
       boomerangActive = true;
       lastTaskSummary = null;
+      lastHandoffSummary = null;
       pendingSkill = null;
       autoAwaitingAssistantAfterId = candidate.targetId;
 
@@ -2060,7 +2077,7 @@ export default function (pi: ExtensionAPI) {
         toolAnchorEntryId = null;
         await restoreModelAndThinking(ctx);
         if (shouldTriggerHandoff) {
-          triggerOrchestratorHandoff();
+          triggerOrchestratorHandoff(generatedSummary.summary);
         }
         return;
       }
@@ -2068,9 +2085,12 @@ export default function (pi: ExtensionAPI) {
       // Use navigateTree for immediate UI update
       const targetId = toolAnchorEntryId;
       toolAnchorEntryId = null;
+      lastTaskSummary = null;
+      lastHandoffSummary = null;
       pendingCollapse = { targetId, task: "Agent-initiated task", commandCtx: storedCommandCtx };
 
       let shouldTriggerHandoff = false;
+      let handoffSummary: string | null = null;
       try {
         globalThis.__boomerangCollapseInProgress = true;
         keepBoomerangExpanded(ctx);
@@ -2079,6 +2099,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Summary cancelled", "warning");
         } else {
           justCollapsedEntryId = storedCommandCtx.sessionManager.getLeafId();
+          handoffSummary = lastHandoffSummary ?? lastTaskSummary;
           ctx.ui.notify("Boomerang complete. Context summarized.", "info");
           shouldTriggerHandoff = true;
         }
@@ -2089,8 +2110,8 @@ export default function (pi: ExtensionAPI) {
       }
       pendingCollapse = null;
       await restoreModelAndThinking(ctx);
-      if (shouldTriggerHandoff) {
-        triggerOrchestratorHandoff();
+      if (shouldTriggerHandoff && handoffSummary) {
+        triggerOrchestratorHandoff(handoffSummary);
       }
       return;
     }
@@ -2120,7 +2141,7 @@ export default function (pi: ExtensionAPI) {
       clearTaskState();
       updateStatus(ctx);
       if (shouldTriggerHandoff) {
-        triggerOrchestratorHandoff();
+        triggerOrchestratorHandoff(generatedSummary.summary);
       }
       return;
     }
@@ -2131,6 +2152,7 @@ export default function (pi: ExtensionAPI) {
     const { targetId, commandCtx } = collapseRequest;
 
     let shouldTriggerHandoff = false;
+    let handoffSummary: string | null = null;
     try {
       globalThis.__boomerangCollapseInProgress = true;
       keepBoomerangExpanded(ctx);
@@ -2143,6 +2165,7 @@ export default function (pi: ExtensionAPI) {
         // State changed during summarization (for example via /boomerang-cancel).
       } else {
         justCollapsedEntryId = commandCtx.sessionManager.getLeafId();
+        handoffSummary = lastHandoffSummary ?? lastTaskSummary;
         if (anchorEntryId !== null && targetId === anchorEntryId && lastTaskSummary) {
           anchorSummaries.push(lastTaskSummary);
         }
@@ -2158,8 +2181,8 @@ export default function (pi: ExtensionAPI) {
     await restoreModelAndThinking(ctx);
     clearTaskState();
     updateStatus(ctx);
-    if (shouldTriggerHandoff) {
-      triggerOrchestratorHandoff();
+    if (shouldTriggerHandoff && handoffSummary) {
+      triggerOrchestratorHandoff(handoffSummary);
     }
   });
 
@@ -2198,6 +2221,8 @@ export default function (pi: ExtensionAPI) {
     } else {
       finalSummary = summaryText;
     }
+
+    lastHandoffSummary = finalSummary;
 
     return {
       summary: {
