@@ -1056,7 +1056,11 @@ export default function (pi: ExtensionAPI) {
     const expandedContent = substituteArgs(step.template.content, effectiveArgs);
     const leafBeforeSend = ctx.sessionManager.getLeafId();
 
-    pi.sendUserMessage(expandedContent);
+    // agent_end fires before the runtime's isStreaming flag clears, so a bare
+    // sendUserMessage during chain advancement throws "Agent is already
+    // processing". deliverAs:"followUp" queues when streaming, sends normally
+    // when idle — safe in both contexts (initial step and post-step-N advance).
+    pi.sendUserMessage(expandedContent, { deliverAs: "followUp" });
     markAwaitingAssistant(ctx, expandedContent, leafBeforeSend ?? chainState.targetId);
   }
 
