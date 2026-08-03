@@ -175,7 +175,7 @@ describe("Boomerang Extension", () => {
   let currentCwd: string;
   let currentLeafId: string | null;
   let currentModel: { provider: string; id: string };
-  let currentThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  let currentThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   let agentIdle: boolean;
   let allModels: { provider: string; id: string }[];
   let availableModels: { provider: string; id: string }[];
@@ -1043,6 +1043,15 @@ describe("Boomerang Extension", () => {
 
       expect(setThinkingCalls).toEqual(["xhigh"]);
       expect(currentThinking).toBe("xhigh");
+    });
+
+    it("supports Pi max thinking from template frontmatter", async () => {
+      writePrompt("user", "deep-dive", "---\nthinking: max\n---\nInspect $@");
+
+      await runBoomerang("/deep-dive auth");
+
+      expect(setThinkingCalls).toEqual(["max"]);
+      expect(currentThinking).toBe("max");
     });
 
     it("restores the previous thinking level after summarizing", async () => {

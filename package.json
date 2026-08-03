@@ -16,16 +16,15 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
-  "dependencies": {
-    "typebox": "^1.1.24"
-  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.75.4"
+    "@earendil-works/pi-coding-agent": ">=0.75.4",
+    "typebox": "*"
   },
   "devDependencies": {
     "vitest": "^2.0.0",
-    "@earendil-works/pi-coding-agent": "0.75.4",
-    "@earendil-works/pi-ai": "0.75.4"
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-ai": "0.83.0",
+    "typebox": "^1.3.7"
   },
   "pi": {
     "extensions": [

@@ -10,7 +10,6 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CustomEditor, type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext, type SessionEntry, type SessionManager } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -436,7 +435,10 @@ interface RethrowState {
 const TEMPLATE_LOAD_FAILED = Symbol("template-load-failed");
 type TemplateLoadResult = PromptTemplate | null | typeof TEMPLATE_LOAD_FAILED;
 
-const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+type PiThinkingLevel = ReturnType<ExtensionAPI["getThinkingLevel"]>;
+type ThinkingLevel = PiThinkingLevel | "max";
+
+const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 function parseCommandArgs(argsString: string): string[] {
   const args: string[] = [];
@@ -550,6 +552,8 @@ export function getEffectiveArgs(step: ChainStep, globalArgs: string[]): string[
 }
 
 export default function (pi: ExtensionAPI) {
+  const setThinkingLevel = (level: ThinkingLevel) => pi.setThinkingLevel(level as PiThinkingLevel);
+
   let boomerangActive = false;
 
   let anchorEntryId: string | null = null;
@@ -802,7 +806,7 @@ export default function (pi: ExtensionAPI) {
       const alreadyOnThinking = pi.getThinkingLevel() === thinkingToRestore;
       if (!alreadyOnThinking) {
         try {
-          pi.setThinkingLevel(thinkingToRestore);
+          setThinkingLevel(thinkingToRestore);
           restoredParts.push(`thinking:${thinkingToRestore}`);
         } catch (error) {
           restoreErrors.push(`thinking:${thinkingToRestore} (${String(error)})`);
@@ -1025,7 +1029,7 @@ export default function (pi: ExtensionAPI) {
     if (step.template.thinking) {
       const currentThinking = pi.getThinkingLevel();
       if (step.template.thinking !== currentThinking) {
-        pi.setThinkingLevel(step.template.thinking);
+        setThinkingLevel(step.template.thinking);
         configEntry.thinking = step.template.thinking;
       }
     }
@@ -1145,7 +1149,7 @@ export default function (pi: ExtensionAPI) {
               if (template.thinking) {
                 const currentThinking = pi.getThinkingLevel();
                 if (template.thinking !== currentThinking) {
-                  pi.setThinkingLevel(template.thinking);
+                  setThinkingLevel(template.thinking);
                   configEntry.thinking = template.thinking;
                 }
               }
@@ -1203,7 +1207,7 @@ export default function (pi: ExtensionAPI) {
             if (!aborted && template.thinking) {
               const currentThinking = pi.getThinkingLevel();
               if (template.thinking !== currentThinking) {
-                pi.setThinkingLevel(template.thinking);
+                setThinkingLevel(template.thinking);
                 switchedToThinking = template.thinking;
               }
             }
@@ -1319,12 +1323,13 @@ export default function (pi: ExtensionAPI) {
       return editorRef;
     });
 
-    if (!editorRef?.onSubmit) {
+    const editor = editorRef as unknown as { onSubmit?: (text: string) => void | Promise<void> } | null;
+    if (!editor?.onSubmit) {
       throw new Error("temporary editor was not wired for submission");
     }
 
     try {
-      await editorRef.onSubmit("/reload");
+      await editor.onSubmit("/reload");
     } finally {
       if (editorText.length > 0) {
         ctx.ui.setEditorText(editorText);
@@ -1786,7 +1791,7 @@ export default function (pi: ExtensionAPI) {
 
       if (template.thinking && template.thinking !== savedThinking) {
         previousThinking = savedThinking;
-        pi.setThinkingLevel(template.thinking);
+        setThinkingLevel(template.thinking);
         switchedToThinking = template.thinking;
       }
 
