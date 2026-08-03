@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-03
+
 ### Changed
 - Support Pi's `max` thinking level in prompt-template frontmatter and align TypeBox packaging with Pi's bundled extension dependencies.
 
