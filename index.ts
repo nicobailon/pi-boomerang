@@ -2179,7 +2179,10 @@ export default function (pi: ExtensionAPI) {
     if (toolQueuedTask && storedCommandCtx) {
       const task = toolQueuedTask;
       toolQueuedTask = null;
-      await startTask(task, storedCommandCtx, { model: ctx.model, thinking: pi.getThinkingLevel() });
+      // Pi holds prompts sent from agent_settled until its handlers return, and a rethrow
+      // waits for its first turn to start, so the task must not run inside this handler.
+      void startTask(task, storedCommandCtx, { model: ctx.model, thinking: pi.getThinkingLevel() })
+        .catch((err) => ctx.ui.notify(`Boomerang task failed: ${String(err)}`, "error"));
       return;
     }
 
