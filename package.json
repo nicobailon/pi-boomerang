@@ -17,7 +17,7 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.75.4",
+    "@earendil-works/pi-coding-agent": ">=0.80.4",
     "typebox": "*"
   },
   "devDependencies": {

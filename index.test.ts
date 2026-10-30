@@ -4,6 +4,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_COMPACTION_SETTINGS } from "@earendil-works/pi-coding-agent";
 import type {
   AgentEndEvent,
+  AgentSettledEvent,
   ExtensionAPI,
   ExtensionContext,
   ExtensionCommandContext,
@@ -384,6 +385,9 @@ describe("Boomerang Extension", () => {
 
   function createCommandCtx(overrides: Partial<ExtensionCommandContext> = {}) {
     const navigateTree = vi.fn(async (targetId: string, options: { summarize?: boolean }) => {
+      if (!agentIdle) {
+        throw new Error("Wait for the current response to finish before navigating the session tree.");
+      }
       navigateTreeCalls.push({ targetId, options });
       await captureTreeSummary(targetId);
       return { cancelled: false };
@@ -428,12 +432,13 @@ describe("Boomerang Extension", () => {
   }
 
   async function triggerAgentEnd(ctx: ExtensionContext = mockCtx, options: { idle?: boolean } = {}) {
+    // Pi fires agent_end while the run is still active, then agent_settled once it has stopped.
+    agentIdle = false;
+    const event: AgentEndEvent = { type: "agent_end", messages: [] };
+    await getHandler("agent_end")?.(event, ctx);
     agentIdle = options.idle ?? true;
-    const handler = getHandler("agent_end");
-    if (handler) {
-      const event: AgentEndEvent = { type: "agent_end", messages: [] };
-      await handler(event, ctx);
-    }
+    const settled: AgentSettledEvent = { type: "agent_settled" };
+    await getHandler("agent_settled")?.(settled, ctx);
   }
 
   function makeBeforeCompactEvent(): SessionBeforeCompactEvent {
@@ -786,13 +791,13 @@ describe("Boomerang Extension", () => {
       expect(sentMessages).toEqual(["Step 1", "Step 2"]);
     });
 
-    it("queues the next chain step as a follow-up during streaming agent_end", async () => {
+    it("queues the next chain step as a follow-up", async () => {
       writePrompt("user", "step1", "Step 1");
       writePrompt("user", "step2", "Step 2");
 
       await runBoomerang("/step1 -> /step2 -- task");
       addAssistantTextEntry("Step 1 done");
-      await triggerAgentEnd(mockCtx, { idle: false });
+      await triggerAgentEnd();
 
       expect(sentMessages).toEqual(["Step 1", "Step 2"]);
       expect(mockPi.sendUserMessage).toHaveBeenNthCalledWith(2, "Step 2", { deliverAs: "followUp" });
