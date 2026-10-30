@@ -2143,7 +2143,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  // Pi keeps the run active (and navigateTree throwing) until agent_settled, so collapse waits for it.
+  pi.on("agent_settled", async (_event, ctx) => {
     if (rethrowState) return;
 
     if (boomerangActive && autoAwaitingAssistantAfterId !== null) {
@@ -2338,7 +2339,7 @@ export default function (pi: ExtensionAPI) {
     const summaryText = generatedSummary.summary;
 
     // Save for accumulation after successful summarization (read by runRethrowLoop
-    // for rethrows, or by agent_end for anchor accumulation in single boomerangs)
+    // for rethrows, or by agent_settled for anchor accumulation in single boomerangs)
     lastTaskSummary = summaryText;
 
     // Precedence: rethrow accumulation > user-anchor accumulation > raw summary
