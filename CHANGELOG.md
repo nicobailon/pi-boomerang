@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Summarize finished boomerang tasks once Pi has fully settled the run, instead of failing with "Wait for the current response to finish before navigating the session tree." Requires Pi 0.80.4 or newer ([#14](https://github.com/nicobailon/pi-boomerang/issues/14), reported by [@MaksimZinovev](https://github.com/MaksimZinovev)).
+- Start `--rethrow` tasks queued by the agent through the boomerang tool after the current run settles, instead of hanging the session ([#17](https://github.com/nicobailon/pi-boomerang/issues/17)).
 
 ## [0.7.0] - 2026-08-03
 

@@ -178,6 +178,8 @@ describe("Boomerang Extension", () => {
   let currentModel: { provider: string; id: string };
   let currentThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   let agentIdle: boolean;
+  let settling = false;
+  let heldUserMessages: string[] = [];
   let allModels: { provider: string; id: string }[];
   let availableModels: { provider: string; id: string }[];
   let switchFailures: Set<string>;
@@ -431,14 +433,31 @@ describe("Boomerang Extension", () => {
     return handler ? await handler({ type: "input", text, source }, mockCtx) : undefined;
   }
 
+  function deliverUserMessage(content: string) {
+    agentIdle = false;
+    sentMessages.push(content);
+    addSessionEntry({
+      type: "message",
+      message: { role: "user", content, timestamp: Date.now() },
+      timestamp: new Date().toISOString(),
+    });
+  }
+
   async function triggerAgentEnd(ctx: ExtensionContext = mockCtx, options: { idle?: boolean } = {}) {
     // Pi fires agent_end while the run is still active, then agent_settled once it has stopped.
+    // Prompts sent from agent_settled handlers start only after the handlers return.
     agentIdle = false;
     const event: AgentEndEvent = { type: "agent_end", messages: [] };
     await getHandler("agent_end")?.(event, ctx);
     agentIdle = options.idle ?? true;
     const settled: AgentSettledEvent = { type: "agent_settled" };
-    await getHandler("agent_settled")?.(settled, ctx);
+    settling = true;
+    try {
+      await getHandler("agent_settled")?.(settled, ctx);
+    } finally {
+      settling = false;
+    }
+    for (const content of heldUserMessages.splice(0)) deliverUserMessage(content);
   }
 
   function makeBeforeCompactEvent(): SessionBeforeCompactEvent {
@@ -618,16 +637,14 @@ describe("Boomerang Extension", () => {
       registerTool: vi.fn((tool: { name: string; execute: Function }) => tools.set(tool.name, tool)),
       registerShortcut: vi.fn((key: string, options: { description: string; handler: Function }) => shortcuts.set(key, options)),
       sendUserMessage: vi.fn((content: string, options?: { deliverAs?: "steer" | "followUp" }) => {
+        if (settling) {
+          heldUserMessages.push(content);
+          return;
+        }
         if (!agentIdle && !options?.deliverAs) {
           throw new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
         }
-        agentIdle = false;
-        sentMessages.push(content);
-        addSessionEntry({
-          type: "message",
-          message: { role: "user", content, timestamp: Date.now() },
-          timestamp: new Date().toISOString(),
-        });
+        deliverUserMessage(content);
       }),
       sendMessage: vi.fn((message: { customType: string; content: string; display: boolean; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: string }) => {
         sentCustomMessages.push({ message, options });
@@ -2123,10 +2140,10 @@ describe("Boomerang Extension", () => {
       expect(result.content[0].text).toContain("Task queued");
 
       await triggerAgentEnd();
+      await vi.waitFor(() => expect(uiMock.notify).toHaveBeenCalledWith("Rethrow complete: 2/2", "info"));
 
       expect(sentMessages).toEqual(["Task content", "Task content"]);
       expect(uiMock.notify).toHaveBeenCalledWith("Rethrow started: 2 iterations", "info");
-      expect(uiMock.notify).toHaveBeenCalledWith("Rethrow complete: 2/2", "info");
     });
 
     it("agent can queue a chain rethrow task via the tool", async () => {
@@ -2140,6 +2157,7 @@ describe("Boomerang Extension", () => {
       expect(result.content[0].text).toContain("Task queued");
 
       await triggerAgentEnd();
+      await vi.waitFor(() => expect(navigateTreeCalls).toHaveLength(2));
 
       expect(sentMessages).toEqual([
         "Scout: task",
@@ -2160,6 +2178,7 @@ describe("Boomerang Extension", () => {
       expect(result.content[0].text).toContain("Task queued");
 
       await triggerAgentEnd();
+      await vi.waitFor(() => expect(navigateTreeCalls).toHaveLength(2));
 
       expect(sentMessages).toEqual(["Task fix auth", "Task fix auth"]);
       expect(uiMock.notify).toHaveBeenCalledWith("Mapped --loop to boomerang --rethrow 2.", "info");
